@@ -89,12 +89,14 @@ async def pipe(
     stats: SessionStats,
     is_upload: bool,
 ) -> None:
-    drain_threshold = 256 * 1024
+    drain_threshold = 128 * 1024
     pending = 0
     try:
         while True:
-            data = await reader.read(65536)
+            data = await reader.read(131072)
             if not data:
+                break
+            if writer.is_closing():
                 break
             if is_upload:
                 stats.upload_bytes += len(data)
@@ -109,8 +111,12 @@ async def pipe(
         pass
     finally:
         try:
+            if not writer.is_closing():
+                writer.write_eof()
+        except (ConnectionError, OSError, RuntimeError):
+            pass
+        try:
             writer.close()
-            await writer.wait_closed()
         except (ConnectionError, OSError, RuntimeError):
             pass
 
@@ -313,6 +319,7 @@ async def handle_client(
                 asyncio.open_connection(host, port),
                 timeout=connect_timeout,
             )
+            _set_socket_options(target_writer)
             t1 = time.perf_counter()
             LOG.debug(
                 "[sid=%s] backend connect timing: %.0fms to %s:%s (timeout=%.1fs)",
@@ -439,6 +446,12 @@ async def main_async(args: argparse.Namespace) -> None:
     ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     ssl_ctx.load_cert_chain(certfile=args.cert, keyfile=args.key)
     ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        ssl_ctx.set_ciphers(
+            "ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS"
+        )
+    except ssl.SSLError:
+        pass
 
     server = await asyncio.start_server(
         lambda r, w: handle_client(

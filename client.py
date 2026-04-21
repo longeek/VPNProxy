@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import base64
 import collections
 import errno
 import ipaddress
@@ -66,16 +67,22 @@ class TcpLineTargetError(ValueError):
     pass
 
 
+class ProxyAuthError(ValueError):
+    pass
+
+
 UDP_FRAME_VERSION = 1
 
 
 async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    drain_threshold = 256 * 1024
+    drain_threshold = 128 * 1024
     pending = 0
     try:
         while True:
-            data = await reader.read(65536)
+            data = await reader.read(131072)
             if not data:
+                break
+            if writer.is_closing():
                 break
             writer.write(data)
             pending += len(data)
@@ -86,8 +93,12 @@ async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> No
         pass
     finally:
         try:
+            if not writer.is_closing():
+                writer.write_eof()
+        except (ConnectionError, OSError, RuntimeError):
+            pass
+        try:
             writer.close()
-            await writer.wait_closed()
         except (ConnectionError, OSError, RuntimeError):
             pass
 
@@ -117,16 +128,45 @@ async def socks5_read_address(
 
 
 async def socks5_handshake(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    proxy_user: Optional[str] = None,
+    proxy_pass: Optional[str] = None,
 ) -> tuple[str, int, int]:
     header = await read_exact(reader, 2)
     ver, nmethods = header[0], header[1]
     if ver != SOCKS_VERSION:
         raise SocksProtocolError("unsupported SOCKS version", 0x01)
 
-    await read_exact(reader, nmethods)
-    writer.write(bytes([SOCKS_VERSION, 0x00]))
-    await writer.drain()
+    methods = await read_exact(reader, nmethods)
+    require_auth = proxy_user is not None
+    if require_auth:
+        if 0x02 not in methods:
+            writer.write(bytes([SOCKS_VERSION, 0xFF]))
+            await writer.drain()
+            raise SocksProtocolError("proxy requires auth but client did not offer method 0x02", 0xFF)
+        writer.write(bytes([SOCKS_VERSION, 0x02]))
+        await writer.drain()
+        auth_ver = (await read_exact(reader, 1))[0]
+        if auth_ver != 0x01:
+            raise SocksProtocolError("unsupported SOCKS auth sub-negotiation version", 0xFF)
+        ulen = (await read_exact(reader, 1))[0]
+        username = (await read_exact(reader, ulen)).decode("utf-8", errors="replace")
+        plen = (await read_exact(reader, 1))[0]
+        password = (await read_exact(reader, plen)).decode("utf-8", errors="replace")
+        if username != proxy_user or password != proxy_pass:
+            writer.write(bytes([0x01, 0x01]))
+            await writer.drain()
+            raise SocksProtocolError("SOCKS auth failed", 0x02)
+        writer.write(bytes([0x01, 0x00]))
+        await writer.drain()
+    else:
+        if 0x00 not in methods:
+            writer.write(bytes([SOCKS_VERSION, 0xFF]))
+            await writer.drain()
+            raise SocksProtocolError("no acceptable auth method", 0xFF)
+        writer.write(bytes([SOCKS_VERSION, 0x00]))
+        await writer.drain()
 
     req_header = await read_exact(reader, 4)
     ver, cmd, _rsv, atyp = req_header
@@ -177,11 +217,25 @@ def build_tls_context(
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx.set_ciphers(
+                "ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS"
+            )
+        except ssl.SSLError:
+            pass
         return ctx
 
     if ca_cert:
-        return ssl.create_default_context(cafile=ca_cert)
-    return ssl.create_default_context()
+        ctx = ssl.create_default_context(cafile=ca_cert)
+    else:
+        ctx = ssl.create_default_context()
+    try:
+        ctx.set_ciphers(
+            "ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS"
+        )
+    except ssl.SSLError:
+        pass
+    return ctx
 
 
 def resolve_tunnel_tls(args: argparse.Namespace) -> tuple[ssl.SSLContext, Optional[str]]:
@@ -674,7 +728,11 @@ async def handle_socks_client(
     peer = client_writer.get_extra_info("peername")
     _set_socket_options(client_writer)
     try:
-        target_host, target_port, cmd = await socks5_handshake(client_reader, client_writer)
+        target_host, target_port, cmd = await socks5_handshake(
+            client_reader, client_writer,
+            proxy_user=getattr(args, "proxy_user", None),
+            proxy_pass=getattr(args, "proxy_pass", None),
+        )
         LOG.debug(
             "[sid=%s] request from %s cmd=0x%02x to %s:%s",
             session_id,
@@ -731,6 +789,35 @@ async def handle_socks_client(
             pass
 
 
+def _check_http_basic_auth(
+    header_block: bytes, proxy_user: str, proxy_pass: str
+) -> bool:
+    for line in header_block.split(b"\r\n"):
+        if not line.lower().startswith(b"proxy-authorization:"):
+            continue
+        try:
+            header_value = line.split(b":", 1)[1].strip()
+            if not header_value.lower().startswith(b"basic "):
+                continue
+            b64val = header_value[6:].strip()
+            decoded = base64.b64decode(b64val).decode("utf-8", errors="replace")
+            user, _, password = decoded.partition(":")
+            if user == proxy_user and password == proxy_pass:
+                return True
+        except Exception:
+            pass
+        break
+    return False
+
+
+_RESP_407 = (
+    b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+    b"Proxy-Authenticate: Basic realm=\"VPNProxy\"\r\n"
+    b"Content-Length: 0\r\n\r\n"
+)
+_RESP_400 = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"
+
+
 async def handle_http_client(
     client_reader: asyncio.StreamReader,
     client_writer: asyncio.StreamWriter,
@@ -741,8 +828,23 @@ async def handle_http_client(
     session_id = uuid.uuid4().hex[:8]
     peer = client_writer.get_extra_info("peername")
     _set_socket_options(client_writer)
+    proxy_user = getattr(args, "proxy_user", None)
+    proxy_pass = getattr(args, "proxy_pass", None)
     try:
         header_block = await client_reader.readuntil(b"\r\n\r\n")
+        if proxy_user is not None:
+            if not _check_http_basic_auth(header_block, proxy_user, proxy_pass):
+                client_writer.write(_RESP_407)
+                await client_writer.drain()
+                try:
+                    header_block = await client_reader.readuntil(b"\r\n\r\n")
+                except (ConnectionError, OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+                    return
+                if not _check_http_basic_auth(header_block, proxy_user, proxy_pass):
+                    client_writer.write(_RESP_407)
+                    await client_writer.drain()
+                    client_writer.close()
+                    return
         target_host, target_port = parse_http_connect_target(header_block)
         LOG.debug(
             "[sid=%s] HTTP CONNECT from %s to %s:%s",
@@ -778,13 +880,13 @@ async def handle_http_client(
     ) as exc:
         LOG.warning("[sid=%s] HTTP proxy failed from %s: %s", session_id, peer, exc)
         try:
-            client_writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-            await client_writer.drain()
+            if not client_writer.is_closing():
+                client_writer.write(_RESP_400)
+                await client_writer.drain()
         except (ConnectionError, OSError, RuntimeError):
             pass
         try:
             client_writer.close()
-            await client_writer.wait_closed()
         except (ConnectionError, OSError, RuntimeError):
             pass
 
@@ -910,6 +1012,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="seconds to keep warm connections in pool (env VPN_PROXY_POOL_TTL)",
     )
     parser.add_argument(
+        "--proxy-user",
+        default=os.getenv("VPN_PROXY_USER"),
+        help="require proxy authentication: username (env VPN_PROXY_USER)",
+    )
+    parser.add_argument(
+        "--proxy-pass",
+        default=os.getenv("VPN_PROXY_PASS"),
+        help="require proxy authentication: password (env VPN_PROXY_PASS)",
+    )
+    parser.add_argument(
         "--log-level",
         default=os.getenv("VPN_PROXY_LOG_LEVEL", "INFO"),
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -922,6 +1034,8 @@ async def main_async(args: argparse.Namespace) -> None:
         raise SystemExit("missing --server or VPN_PROXY_SERVER")
     if not args.token:
         raise SystemExit("missing --token or VPN_PROXY_TOKEN")
+    if (args.proxy_user is None) != (args.proxy_pass is None):
+        raise SystemExit("--proxy-user and --proxy-pass must be specified together")
 
     pool: Optional[TunnelPool] = None
     if args.pool_size > 0:
@@ -960,7 +1074,8 @@ async def main_async(args: argparse.Namespace) -> None:
         addrs = ", ".join(
             str(sock.getsockname()) for s in servers for sock in (s.sockets or [])
         )
-        LOG.info("local proxy listening on %s", addrs)
+        auth_info = f", auth={args.proxy_user}" if args.proxy_user else ""
+        LOG.info("local proxy listening on %s%s", addrs, auth_info)
         try:
             await asyncio.gather(*(s.serve_forever() for s in servers))
         finally:

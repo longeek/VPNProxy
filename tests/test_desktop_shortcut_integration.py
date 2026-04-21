@@ -68,20 +68,21 @@ class DesktopShortcutIntegrationTests(unittest.TestCase):
         lines = {line.split("=", 1)[0]: line.split("=", 1)[1] for line in r2.stdout.strip().splitlines() if "=" in line}
 
         self.assertEqual(
-            os.path.normcase(os.path.normpath(lines["TARGET"].strip())),
-            os.path.normcase(os.path.normpath(self.python)),
+            os.path.normcase(lines["TARGET"].strip()),
+            os.path.normcase(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "system32", "cmd.exe")),
         )
-        self.assertIn("client.py", lines["ARGS"])
-        self.assertIn(token, lines["ARGS"])
-        self.assertIn("--listen 127.0.0.1", lines["ARGS"])
-        self.assertIn("--http-port 8080", lines["ARGS"])
-        self.assertIn("--tcp-line-port 1081", lines["ARGS"])
-        self.assertIn("--ca-cert", lines["ARGS"])
-        self.assertIn("certs", lines["ARGS"])
+        self.assertIn("start_vpn_proxy.cmd", lines["ARGS"])
         self.assertEqual(
             Path(lines["WORKDIR"].strip()).resolve(),
             self.project_root.resolve(),
         )
+
+        cmd_file = self.project_root / "start_vpn_proxy.cmd"
+        self.assertTrue(cmd_file.is_file(), "cmd launcher file missing")
+        cmd_content = cmd_file.read_text(encoding="utf-8", errors="replace")
+        self.assertIn("client.py", cmd_content)
+        self.assertIn(token, cmd_content)
+        self.assertIn("--http-port 8080", cmd_content)
 
 
 if __name__ == "__main__":

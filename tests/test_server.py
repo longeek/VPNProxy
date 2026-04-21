@@ -87,20 +87,23 @@ class ServerPipeDrainTests(unittest.IsolatedAsyncioTestCase):
             def close(self) -> None:
                 self.closed = True
 
-            async def wait_closed(self) -> None:
-                return None
+            def is_closing(self) -> bool:
+                return self.closed
+
+            def write_eof(self) -> None:
+                pass
 
         writer = CountingWriter()
         stats = server.SessionStats()
 
-        reader.feed_data(b"a" * 65536)
-        reader.feed_data(b"b" * 65536)
-        reader.feed_data(b"c" * 65536)
+        reader.feed_data(b"a" * 32768)
+        reader.feed_data(b"b" * 32768)
+        reader.feed_data(b"c" * 32768)
         reader.feed_eof()
 
         await server.pipe(reader, writer, stats, True)
         self.assertEqual(writer.drain_calls, 0)
-        self.assertEqual(stats.upload_bytes, 3 * 65536)
+        self.assertEqual(stats.upload_bytes, 3 * 32768)
 
     async def test_pipe_drains_periodically_for_large_transfer(self):
         reader = asyncio.StreamReader()
@@ -118,16 +121,19 @@ class ServerPipeDrainTests(unittest.IsolatedAsyncioTestCase):
             def close(self) -> None:
                 return None
 
-            async def wait_closed(self) -> None:
-                return None
+            def is_closing(self) -> bool:
+                return False
+
+            def write_eof(self) -> None:
+                pass
 
         writer = CountingWriter()
         stats = server.SessionStats()
 
-        for _ in range(5):
+        for _ in range(8):
             reader.feed_data(b"x" * 65536)
         reader.feed_eof()
 
         await server.pipe(reader, writer, stats, False)
         self.assertGreaterEqual(writer.drain_calls, 1)
-        self.assertEqual(stats.download_bytes, 5 * 65536)
+        self.assertEqual(stats.download_bytes, 8 * 65536)

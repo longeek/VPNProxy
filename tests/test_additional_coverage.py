@@ -23,6 +23,12 @@ class FakeWriter:
     def close(self):
         self.closed = True
 
+    def is_closing(self):
+        return self.closed
+
+    def write_eof(self):
+        pass
+
     async def wait_closed(self):
         return None
 
@@ -352,6 +358,8 @@ class ClientMainCoverageTests(unittest.IsolatedAsyncioTestCase):
             retry_delay=0.01,
             pool_size=0,
             pool_ttl=8.0,
+            proxy_user=None,
+            proxy_pass=None,
             log_level="INFO",
         )
         fake_server = FakeServer()

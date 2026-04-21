@@ -13,6 +13,8 @@ param(
   [switch]$Insecure = $false,
   [int]$PoolSize = 2,
   [double]$PoolTtl = 8.0,
+  [string]$ProxyUser = "",
+  [string]$ProxyPass = "",
   [string]$DesktopPath = "",
   [string]$LinkName = "VPNProxy Client.lnk"
 )
@@ -80,6 +82,9 @@ if ($TcpLinePort -gt 0) {
 }
 if ($PoolSize -gt 0) {
   $pyArgs += " --pool-size $PoolSize --pool-ttl $PoolTtl"
+}
+if ($ProxyUser -and $ProxyPass) {
+  $pyArgs += " --proxy-user $ProxyUser --proxy-pass $ProxyPass"
 }
 
 $batchContent = "@echo off`r`n"
