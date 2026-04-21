@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import collections
 import errno
 import ipaddress
 import json
@@ -19,6 +20,28 @@ LOG = logging.getLogger("vpn-proxy-client")
 
 
 SOCKS_VERSION = 5
+
+_RECV_BUF = 256 * 1024
+
+
+def _set_socket_options(writer: asyncio.StreamWriter) -> None:
+    if not hasattr(writer, "get_extra_info"):
+        return
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _RECV_BUF)
+    except OSError:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _RECV_BUF)
+    except OSError:
+        pass
 
 
 class SocksProtocolError(ValueError):
@@ -162,7 +185,6 @@ def build_tls_context(
 
 
 def resolve_tunnel_tls(args: argparse.Namespace) -> tuple[ssl.SSLContext, Optional[str]]:
-    # Reuse SSL context across sessions to avoid repeated CA loading and setup.
     ssl_ctx: Optional[ssl.SSLContext] = getattr(args, "_vpn_proxy_ssl_ctx", None)
     if ssl_ctx is None:
         ssl_ctx = build_tls_context(args.ca_cert, args.insecure)
@@ -170,6 +192,118 @@ def resolve_tunnel_tls(args: argparse.Namespace) -> tuple[ssl.SSLContext, Option
 
     server_name = args.sni or (None if args.insecure else args.server)
     return ssl_ctx, server_name
+
+
+class TunnelPool:
+    """Pre-established TLS connection pool to reduce tunnel setup latency."""
+
+    def __init__(self, args: argparse.Namespace, max_size: int = 2, ttl: float = 8.0):
+        self._args = args
+        self._max_size = max_size
+        self._ttl = ttl
+        self._pool: list[tuple[asyncio.StreamReader, asyncio.StreamWriter, float]] = []
+        self._lock = asyncio.Lock()
+        self._closed = False
+        self._refill_task: Optional[asyncio.Task] = None
+        self._hits = 0
+
+    async def start(self) -> None:
+        self._closed = False
+        for _ in range(self._max_size):
+            try:
+                r, w = await self._create_tls_connection()
+                self._pool.append((r, w, time.monotonic()))
+            except (ConnectionError, OSError, ssl.SSLError):
+                break
+        self._refill_task = asyncio.create_task(self._refill_loop())
+
+    async def stop(self) -> None:
+        self._closed = True
+        if self._refill_task is not None:
+            self._refill_task.cancel()
+            try:
+                await self._refill_task
+            except asyncio.CancelledError:
+                pass
+        async with self._lock:
+            while self._pool:
+                _, writer, _ = self._pool.pop()
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except (ConnectionError, OSError, RuntimeError):
+                    pass
+        if self._hits:
+            LOG.info("tunnel pool stopped (pool_hits=%d)", self._hits)
+
+    async def _create_tls_connection(
+        self,
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        ssl_ctx, server_name = resolve_tunnel_tls(self._args)
+        reader, writer = await asyncio.open_connection(
+            host=self._args.server,
+            port=self._args.server_port,
+            ssl=ssl_ctx,
+            server_hostname=server_name,
+        )
+        _set_socket_options(writer)
+        return reader, writer
+
+    async def _refill_loop(self) -> None:
+        while not self._closed:
+            await asyncio.sleep(0.3)
+            try:
+                expired = []
+                async with self._lock:
+                    now = time.monotonic()
+                    fresh = []
+                    for item in self._pool:
+                        if (now - item[2]) > self._ttl:
+                            expired.append(item)
+                        else:
+                            fresh.append(item)
+                    self._pool = fresh
+                for _, w, _ in expired:
+                    try:
+                        w.close()
+                        await w.wait_closed()
+                    except (ConnectionError, OSError, RuntimeError):
+                        pass
+                need = 0
+                async with self._lock:
+                    need = self._max_size - len(self._pool)
+                if need > 0:
+                    try:
+                        r, w = await self._create_tls_connection()
+                        async with self._lock:
+                            self._pool.append((r, w, time.monotonic()))
+                    except (ConnectionError, OSError, ssl.SSLError) as exc:
+                        LOG.debug("pool refill failed: %s", exc)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await asyncio.sleep(1.0)
+
+    async def acquire(
+        self,
+    ) -> Optional[tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
+        to_close: list[asyncio.StreamWriter] = []
+        found = None
+        async with self._lock:
+            while self._pool:
+                reader, writer, created = self._pool.pop(0)
+                if (time.monotonic() - created) < self._ttl and not reader.at_eof():
+                    found = (reader, writer)
+                    self._hits += 1
+                    break
+                to_close.append(writer)
+        for w in to_close:
+            try:
+                w.close()
+                await w.wait_closed()
+            except (ConnectionError, OSError, RuntimeError):
+                pass
+        return found
 
 
 def map_socks_reply(exc: BaseException) -> int:
@@ -278,7 +412,38 @@ async def open_tunnel(
     session_id: str,
     *,
     proto: str = "tcp",
+    pool: Optional[TunnelPool] = None,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    if pool is not None:
+        try:
+            conn = await pool.acquire()
+            if conn is not None:
+                reader, writer = conn
+                payload: dict = {
+                    "auth": args.token,
+                    "host": target_host,
+                    "port": target_port,
+                }
+                if proto != "tcp":
+                    payload["proto"] = proto
+                bootstrap = json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
+                writer.write(bootstrap)
+                await writer.drain()
+                try:
+                    status = await asyncio.wait_for(reader.readline(), timeout=10)
+                except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError):
+                    status = b""
+                if status.startswith(b"OK"):
+                    LOG.info("[sid=%s] tunnel from pool (saved TLS handshake)", session_id)
+                    return reader, writer
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except (ConnectionError, OSError, RuntimeError):
+                    pass
+        except (ConnectionError, OSError, ssl.SSLError):
+            pass
+
     last_exc: Optional[Exception] = None
     retries = max(0, args.connect_retries)
     ssl_ctx, server_name = resolve_tunnel_tls(args)
@@ -291,6 +456,7 @@ async def open_tunnel(
                 ssl=ssl_ctx,
                 server_hostname=server_name,
             )
+            _set_socket_options(writer)
             t1 = time.perf_counter()
 
             payload: dict = {
@@ -406,13 +572,15 @@ async def handle_socks_udp_relay(
     client_tcp_writer: asyncio.StreamWriter,
     args: argparse.Namespace,
     session_id: str,
+    *,
+    pool: Optional[TunnelPool] = None,
 ) -> None:
     """SOCKS5 UDP ASSOCIATE: SOCKS UDP header per datagram; replies matched by (dst host, dst port)."""
     loop = asyncio.get_running_loop()
     tunnel_reader, tunnel_writer = await open_tunnel(
-        "0.0.0.0", 0, args, session_id, proto="udp"
+        "0.0.0.0", 0, args, session_id, proto="udp", pool=pool
     )
-    pending: list[tuple[tuple[str, int], str, int]] = []
+    pending: dict[tuple[str, int], list[tuple[tuple[str, int], str, int]]] = {}
     pending_lock = asyncio.Lock()
     tunnel_write_lock = asyncio.Lock()
 
@@ -427,15 +595,14 @@ async def handle_socks_udp_relay(
                     pkt = socks_udp_build_reply(rh, rp, rdata)
                 except ValueError:
                     continue
+                key = (rh, rp)
                 async with pending_lock:
-                    match_i: Optional[int] = None
-                    for i, (ca, dh, dp) in enumerate(pending):
-                        if (dh, dp) == (rh, rp):
-                            match_i = i
-                            break
-                    if match_i is None:
+                    entries = pending.pop(key, None)
+                    if entries is None:
                         continue
-                    client_addr, _, _ = pending.pop(match_i)
+                    client_addr = entries.pop(0)[0]
+                    if entries:
+                        pending[key] = entries
                 tudp.sendto(pkt, client_addr)
         finally:
             pass
@@ -447,7 +614,9 @@ async def handle_socks_udp_relay(
         except ValueError:
             return
         async with pending_lock:
-            pending.append((src_addr, h, p))
+            key = (h, p)
+            li = pending.setdefault(key, [])
+            li.append((src_addr, h, p))
         try:
             async with tunnel_write_lock:
                 tunnel_writer.write(frame)
@@ -498,9 +667,12 @@ async def handle_socks_client(
     client_reader: asyncio.StreamReader,
     client_writer: asyncio.StreamWriter,
     args: argparse.Namespace,
+    *,
+    pool: Optional[TunnelPool] = None,
 ) -> None:
     session_id = uuid.uuid4().hex[:8]
     peer = client_writer.get_extra_info("peername")
+    _set_socket_options(client_writer)
     try:
         target_host, target_port, cmd = await socks5_handshake(client_reader, client_writer)
         LOG.debug(
@@ -513,11 +685,11 @@ async def handle_socks_client(
         )
 
         if cmd == 0x03:
-            await handle_socks_udp_relay(client_reader, client_writer, args, session_id)
+            await handle_socks_udp_relay(client_reader, client_writer, args, session_id, pool=pool)
             return
 
         tunnel_reader, tunnel_writer = await open_tunnel(
-            target_host, target_port, args, session_id
+            target_host, target_port, args, session_id, pool=pool
         )
         await send_socks_reply(client_writer, 0x00)
         LOG.info(
@@ -563,9 +735,12 @@ async def handle_http_client(
     client_reader: asyncio.StreamReader,
     client_writer: asyncio.StreamWriter,
     args: argparse.Namespace,
+    *,
+    pool: Optional[TunnelPool] = None,
 ) -> None:
     session_id = uuid.uuid4().hex[:8]
     peer = client_writer.get_extra_info("peername")
+    _set_socket_options(client_writer)
     try:
         header_block = await client_reader.readuntil(b"\r\n\r\n")
         target_host, target_port = parse_http_connect_target(header_block)
@@ -577,7 +752,7 @@ async def handle_http_client(
             target_port,
         )
         tunnel_reader, tunnel_writer = await open_tunnel(
-            target_host, target_port, args, session_id
+            target_host, target_port, args, session_id, pool=pool
         )
         client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await client_writer.drain()
@@ -618,9 +793,12 @@ async def handle_tcp_line_client(
     client_reader: asyncio.StreamReader,
     client_writer: asyncio.StreamWriter,
     args: argparse.Namespace,
+    *,
+    pool: Optional[TunnelPool] = None,
 ) -> None:
     session_id = uuid.uuid4().hex[:8]
     peer = client_writer.get_extra_info("peername")
+    _set_socket_options(client_writer)
     try:
         line = await client_reader.readline()
         if not line:
@@ -634,7 +812,7 @@ async def handle_tcp_line_client(
             target_port,
         )
         tunnel_reader, tunnel_writer = await open_tunnel(
-            target_host, target_port, args, session_id
+            target_host, target_port, args, session_id, pool=pool
         )
         client_writer.write(b"OK\n")
         await client_writer.drain()
@@ -720,6 +898,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="disable certificate verification (not recommended)",
     )
     parser.add_argument(
+        "--pool-size",
+        type=int,
+        default=int(os.getenv("VPN_PROXY_POOL_SIZE", "0")),
+        help="pre-warmed TLS tunnel pool size (0=disabled, env VPN_PROXY_POOL_SIZE)",
+    )
+    parser.add_argument(
+        "--pool-ttl",
+        type=float,
+        default=float(os.getenv("VPN_PROXY_POOL_TTL", "8.0")),
+        help="seconds to keep warm connections in pool (env VPN_PROXY_POOL_TTL)",
+    )
+    parser.add_argument(
         "--log-level",
         default=os.getenv("VPN_PROXY_LOG_LEVEL", "INFO"),
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -733,43 +923,53 @@ async def main_async(args: argparse.Namespace) -> None:
     if not args.token:
         raise SystemExit("missing --token or VPN_PROXY_TOKEN")
 
-    servers = []
-    servers.append(
-        await asyncio.start_server(
-            lambda r, w: handle_socks_client(r, w, args),
-            host=args.listen,
-            port=args.listen_port,
-        )
-    )
-    http_port = getattr(args, "http_port", None)
-    tcp_line_port = getattr(args, "tcp_line_port", None)
-    if http_port:
-        servers.append(
-            await asyncio.start_server(
-                lambda r, w: handle_http_client(r, w, args),
-                host=args.listen,
-                port=int(http_port),
-            )
-        )
-    if tcp_line_port:
-        servers.append(
-            await asyncio.start_server(
-                lambda r, w: handle_tcp_line_client(r, w, args),
-                host=args.listen,
-                port=int(tcp_line_port),
-            )
-        )
+    pool: Optional[TunnelPool] = None
+    if args.pool_size > 0:
+        pool = TunnelPool(args, max_size=args.pool_size, ttl=args.pool_ttl)
+        await pool.start()
+        LOG.info("tunnel pool started (size=%d, ttl=%.1fs)", args.pool_size, args.pool_ttl)
 
-    addrs = ", ".join(
-        str(sock.getsockname()) for s in servers for sock in (s.sockets or [])
-    )
-    LOG.info("local proxy listening on %s", addrs)
+    servers = []
     try:
-        await asyncio.gather(*(s.serve_forever() for s in servers))
+        servers.append(
+            await asyncio.start_server(
+                lambda r, w: handle_socks_client(r, w, args, pool=pool),
+                host=args.listen,
+                port=args.listen_port,
+            )
+        )
+        http_port = getattr(args, "http_port", None)
+        tcp_line_port = getattr(args, "tcp_line_port", None)
+        if http_port:
+            servers.append(
+                await asyncio.start_server(
+                    lambda r, w: handle_http_client(r, w, args, pool=pool),
+                    host=args.listen,
+                    port=int(http_port),
+                )
+            )
+        if tcp_line_port:
+            servers.append(
+                await asyncio.start_server(
+                    lambda r, w: handle_tcp_line_client(r, w, args, pool=pool),
+                    host=args.listen,
+                    port=int(tcp_line_port),
+                )
+            )
+
+        addrs = ", ".join(
+            str(sock.getsockname()) for s in servers for sock in (s.sockets or [])
+        )
+        LOG.info("local proxy listening on %s", addrs)
+        try:
+            await asyncio.gather(*(s.serve_forever() for s in servers))
+        finally:
+            for s in servers:
+                s.close()
+            await asyncio.gather(*(s.wait_closed() for s in servers), return_exceptions=True)
     finally:
-        for s in servers:
-            s.close()
-        await asyncio.gather(*(s.wait_closed() for s in servers), return_exceptions=True)
+        if pool:
+            await pool.stop()
 
 
 def main() -> None:
@@ -785,6 +985,12 @@ def main() -> None:
         level=getattr(logging, args.log_level),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    try:
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        LOG.info("uvloop enabled")
+    except ImportError:
+        pass
     asyncio.run(main_async(args))
 
 

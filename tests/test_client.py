@@ -26,6 +26,9 @@ class MemoryWriter:
     async def wait_closed(self) -> None:
         return None
 
+    def get_extra_info(self, name: str, default=None):
+        return default
+
 
 class DummyReader:
     def __init__(self, lines):

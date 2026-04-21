@@ -25,6 +25,8 @@ VPN_PROXY_TOKEN=CHANGE_ME_TO_A_LONG_RANDOM_TOKEN
 VPN_PROXY_TOKENS_FILE=
 VPN_PROXY_ALLOW_CIDRS=
 VPN_PROXY_CONNECT_TIMEOUT=8
+VPN_PROXY_BOOTSTRAP_TIMEOUT=30
+VPN_PROXY_BACKLOG=512
 VPN_PROXY_LOG_LEVEL=INFO
 EOF
   chmod 600 "${ENV_FILE}"
@@ -54,6 +56,11 @@ systemctl enable vpn-proxy
 echo "Installed."
 echo "Next steps:"
 echo "1) Place cert and key into /etc/vpn-proxy/"
+echo "   Recommended: ./scripts/gen_cert.sh /etc/vpn-proxy ecdsa (ECDSA P-256, fast TLS handshake)"
+echo "   Legacy:      ./scripts/gen_cert.sh /etc/vpn-proxy vpn-proxy-server 825 '' rsa (RSA-4096)"
 echo "2) Edit ${ENV_FILE} and set VPN_PROXY_TOKEN"
 echo "3) Start service: systemctl restart vpn-proxy"
 echo "4) Check status:  systemctl status vpn-proxy"
+echo ""
+echo "Multi-worker deployment (optional, for high concurrency):"
+echo "  See scripts/nginx_vpn_proxy.conf for nginx load balancer config"

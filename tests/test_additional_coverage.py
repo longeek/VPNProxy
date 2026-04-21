@@ -159,6 +159,8 @@ class ServerMainCoverageTests(unittest.IsolatedAsyncioTestCase):
             listen="0.0.0.0",
             port=8443,
             connect_timeout=1.0,
+            bootstrap_timeout=30.0,
+            backlog=512,
             log_level="INFO",
         )
         ssl_ctx = mock.Mock(spec=ssl.SSLContext)
@@ -250,6 +252,8 @@ class ClientFlowCoverageTests(unittest.IsolatedAsyncioTestCase):
             sni=None,
             connect_retries=0,
             retry_delay=0.01,
+            pool_size=0,
+            pool_ttl=8.0,
         )
         reader = FakeReader(lines=[b"ERR auth\n"])
         writer = FakeWriter()
@@ -270,6 +274,8 @@ class ClientFlowCoverageTests(unittest.IsolatedAsyncioTestCase):
             sni=None,
             connect_retries=0,
             retry_delay=0.01,
+            pool_size=0,
+            pool_ttl=8.0,
         )
         reader = FakeReader()
         writer = FakeWriter()
@@ -291,6 +297,8 @@ class ClientFlowCoverageTests(unittest.IsolatedAsyncioTestCase):
             sni=None,
             connect_retries=0,
             retry_delay=0.01,
+            pool_size=0,
+            pool_ttl=8.0,
         )
         reader = FakeReader()
         writer = FakeWriter()
@@ -342,6 +350,8 @@ class ClientMainCoverageTests(unittest.IsolatedAsyncioTestCase):
             sni=None,
             connect_retries=0,
             retry_delay=0.01,
+            pool_size=0,
+            pool_ttl=8.0,
             log_level="INFO",
         )
         fake_server = FakeServer()

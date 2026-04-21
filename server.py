@@ -5,6 +5,7 @@ import ipaddress
 import json
 import logging
 import os
+import socket
 import ssl
 import struct
 import time
@@ -24,6 +25,29 @@ class AuthError(Exception):
 class SessionStats:
     upload_bytes: int = 0
     download_bytes: int = 0
+
+
+_RECV_BUF = 256 * 1024
+
+
+def _set_socket_options(writer: asyncio.StreamWriter) -> None:
+    if not hasattr(writer, "get_extra_info"):
+        return
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _RECV_BUF)
+    except OSError:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _RECV_BUF)
+    except OSError:
+        pass
 
 
 def load_allowed_tokens(args: argparse.Namespace) -> set[str]:
@@ -256,16 +280,18 @@ async def handle_client(
     allowed_tokens: set[str],
     allow_networks: list[ipaddress._BaseNetwork],
     connect_timeout: float,
+    bootstrap_timeout: float = 30.0,
 ) -> None:
     session_id = uuid.uuid4().hex[:8]
     peer = writer.get_extra_info("peername")
     stats = SessionStats()
     target_writer: Optional[asyncio.StreamWriter] = None
+    _set_socket_options(writer)
     try:
         if not peer_allowed(peer, allow_networks):
             raise PermissionError("peer not in allow-cidrs")
 
-        line = await asyncio.wait_for(reader.readline(), timeout=10)
+        line = await asyncio.wait_for(reader.readline(), timeout=bootstrap_timeout)
         if not line:
             raise ValueError("empty bootstrap")
 
@@ -383,6 +409,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=float(os.getenv("VPN_PROXY_CONNECT_TIMEOUT", "8")),
     )
     parser.add_argument(
+        "--bootstrap-timeout",
+        type=float,
+        default=float(os.getenv("VPN_PROXY_BOOTSTRAP_TIMEOUT", "30")),
+        help="seconds to wait for client bootstrap line (env VPN_PROXY_BOOTSTRAP_TIMEOUT)",
+    )
+    parser.add_argument(
+        "--backlog",
+        type=int,
+        default=int(os.getenv("VPN_PROXY_BACKLOG", "512")),
+        help="listen backlog size (env VPN_PROXY_BACKLOG)",
+    )
+    parser.add_argument(
         "--log-level",
         default=os.getenv("VPN_PROXY_LOG_LEVEL", "INFO"),
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -404,11 +442,13 @@ async def main_async(args: argparse.Namespace) -> None:
 
     server = await asyncio.start_server(
         lambda r, w: handle_client(
-            r, w, allowed_tokens, allow_networks, args.connect_timeout
+            r, w, allowed_tokens, allow_networks, args.connect_timeout,
+            bootstrap_timeout=args.bootstrap_timeout,
         ),
         host=args.listen,
         port=args.port,
         ssl=ssl_ctx,
+        backlog=args.backlog,
     )
 
     sockets = ", ".join(str(sock.getsockname()) for sock in (server.sockets or []))
@@ -424,6 +464,12 @@ def main() -> None:
         level=getattr(logging, args.log_level),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    try:
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        LOG.info("uvloop enabled")
+    except ImportError:
+        pass
     asyncio.run(main_async(args))
 
 
