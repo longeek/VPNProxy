@@ -34,34 +34,64 @@ RESULTS: dict = {}
 def generate_cert(cert_dir: str, algo: str) -> None:
     key_path = os.path.join(cert_dir, "server.key")
     crt_path = os.path.join(cert_dir, "server.crt")
-    if algo == "ecdsa":
-        subprocess.run(
-            [
-                "openssl", "ecparam", "-genkey", "-name", "prime256v1",
-                "-noout", "-out", key_path,
-            ],
-            check=True, capture_output=True,
+    has_openssl = shutil.which("openssl") is not None
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec, rsa
+        from cryptography.x509.oid import NameOID
+        import datetime
+        _cryptography_available = True
+    except ImportError:
+        _cryptography_available = False
+    if has_openssl:
+        if algo == "ecdsa":
+            subprocess.run(
+                ["openssl", "ecparam", "-genkey", "-name", "prime256v1", "-noout", "-out", key_path],
+                check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["openssl", "req", "-x509", "-new", "-key", key_path, "-out", crt_path,
+                 "-sha256", "-days", "1", "-nodes", "-subj", "/CN=bench-server",
+                 "-addext", "subjectAltName=DNS:bench-server,IP:127.0.0.1"],
+                check=True, capture_output=True,
+            )
+        else:
+            subprocess.run(
+                ["openssl", "req", "-x509", "-newkey", "rsa:4096", "-keyout", key_path,
+                 "-out", crt_path, "-sha256", "-days", "1", "-nodes",
+                 "-subj", "/CN=bench-server",
+                 "-addext", "subjectAltName=DNS:bench-server,IP:127.0.0.1"],
+                check=True, capture_output=True,
+            )
+    elif _cryptography_available:
+        import ipaddress as ipmod
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec, rsa
+        from cryptography.x509.oid import NameOID
+        import datetime
+        if algo == "ecdsa":
+            private_key = ec.generate_private_key(ec.SECP256R1())
+        else:
+            private_key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "bench-server")])
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(subject)
+            .public_key(private_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.utcnow())
+            .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=1))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("bench-server"), x509.IPAddress(ipmod.IPv4Address("127.0.0.1"))]), critical=False)
+            .sign(private_key, hashes.SHA256())
         )
-        subprocess.run(
-            [
-                "openssl", "req", "-x509", "-new", "-key", key_path,
-                "-out", crt_path, "-sha256", "-days", "1", "-nodes",
-                "-subj", "/CN=bench-server",
-                "-addext", "subjectAltName=DNS:bench-server,IP:127.0.0.1",
-            ],
-            check=True, capture_output=True,
-        )
+        with open(key_path, "wb") as f:
+            f.write(private_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
+        with open(crt_path, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
     else:
-        subprocess.run(
-            [
-                "openssl", "req", "-x509", "-newkey", "rsa:4096",
-                "-keyout", key_path, "-out", crt_path,
-                "-sha256", "-days", "1", "-nodes",
-                "-subj", "/CN=bench-server",
-                "-addext", "subjectAltName=DNS:bench-server,IP:127.0.0.1",
-            ],
-            check=True, capture_output=True,
-        )
+        raise RuntimeError("Neither openssl nor cryptography library available for certificate generation")
 
 
 async def bench_tls_handshake(cert_dir: str, algo: str, iterations: int) -> list[float]:
