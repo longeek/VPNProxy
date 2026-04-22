@@ -1,0 +1,15 @@
+[Unit]
+Description=VPN Proxy TLS Tunnel Server (Go)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/vpn-proxy/server.env
+ExecStart=/opt/vpn-proxy/vpn-proxy-server --listen ${VPN_PROXY_LISTEN} --port ${VPN_PROXY_PORT} --cert ${VPN_PROXY_CERT} --key ${VPN_PROXY_KEY} --token ${VPN_PROXY_TOKEN} --tokens-file ${VPN_PROXY_TOKENS_FILE} --allow-cidrs ${VPN_PROXY_ALLOW_CIDRS} --connect-timeout ${VPN_PROXY_CONNECT_TIMEOUT} --bootstrap-timeout ${VPN_PROXY_BOOTSTRAP_TIMEOUT}
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -1,5 +1,15 @@
+use vpn_proxy::client_logic::{
+    check_http_basic_auth, pack_udp_frame, parse_http_connect_target, parse_tcp_line_target,
+    socks_udp_build_reply, socks_udp_parse_request,
+    UDP_FRAME_VERSION,
+};
+use vpn_proxy::server_logic::{
+    next_session_id,
+    PIPE_BUF_SIZE, RECV_BUF_SIZE, DRAIN_THRESHOLD,
+};
+
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,14 +20,9 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn, Level};
 use tracing_subscriber::EnvFilter;
 
-const RECV_BUF_SIZE: usize = 256 * 1024;
-const PIPE_BUF_SIZE: usize = 131072;
-const DRAIN_THRESHOLD: usize = 128 * 1024;
 const SOCKS_VERSION: u8 = 5;
-const UDP_FRAME_VERSION: u8 = 1;
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
-fn next_session_id() -> String { format!("{:08x}", SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)) }
 
 fn set_socket_opts(stream: &TcpStream) {
     let sock = socket2::SockRef::from(stream);
@@ -297,19 +302,6 @@ async fn relay_bidirectional(client: TcpStream, tunnel: TlsStream) {
     tokio::select! { _ = up => {}, _ = down => {} }
 }
 
-fn pack_udp_frame(host: &str, port: u16, data: &[u8]) -> Vec<u8> {
-    let hb = host.as_bytes();
-    let mut buf = Vec::with_capacity(4 + hb.len() + 4 + data.len());
-    buf.push(UDP_FRAME_VERSION);
-    buf.push(0);
-    buf.extend_from_slice(&(hb.len() as u16).to_be_bytes());
-    buf.extend_from_slice(hb);
-    buf.extend_from_slice(&port.to_be_bytes());
-    buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
-    buf.extend_from_slice(data);
-    buf
-}
-
 struct UdpFrame {
     host: String,
     port: u16,
@@ -341,70 +333,6 @@ async fn read_udp_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<UdpFr
         reader.read_exact(&mut data).await.map_err(|e| format!("read data: {e}"))?;
     }
     Ok(UdpFrame { host, port, data })
-}
-
-fn socks_udp_parse_request(packet: &[u8]) -> Result<(String, u16, &[u8]), String> {
-    if packet.len() < 10 {
-        return Err("short socks udp packet".to_string());
-    }
-    if packet[0] != 0 || packet[1] != 0 || packet[2] != 0 {
-        return Err("bad socks udp header".to_string());
-    }
-    let atyp = packet[3];
-    let (host, off) = match atyp {
-        0x01 => {
-            if packet.len() < 10 { return Err("short ipv4".to_string()); }
-            let addr: [u8; 4] = packet[4..8].try_into().map_err(|_| "ipv4 parse")?;
-            (std::net::Ipv4Addr::from(addr).to_string(), 8)
-        }
-        0x03 => {
-            let ln = packet[4] as usize;
-            if packet.len() < 5 + ln + 2 { return Err("short domain".to_string()); }
-            let host = String::from_utf8_lossy(&packet[5..5 + ln]).to_string();
-            (host, 5 + ln)
-        }
-        0x04 => {
-            if packet.len() < 20 { return Err("short ipv6".to_string()); }
-            let addr: [u8; 16] = packet[4..20].try_into().map_err(|_| "ipv6 parse")?;
-            (std::net::Ipv6Addr::from(addr).to_string(), 20)
-        }
-        _ => return Err("unsupported atyp".to_string()),
-    };
-    if packet.len() < off + 2 { return Err("short port".to_string()); }
-    let port = u16::from_be_bytes([packet[off], packet[off + 1]]);
-    Ok((host, port, &packet[off + 2..]))
-}
-
-fn socks_udp_build_reply(host: &str, port: u16, data: &[u8]) -> Vec<u8> {
-    let addr: Result<std::net::IpAddr, _> = host.parse();
-    match addr {
-        Ok(std::net::IpAddr::V4(ip)) => {
-            let mut buf = Vec::with_capacity(4 + 4 + 2 + data.len());
-            buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-            buf.extend_from_slice(&ip.octets());
-            buf.extend_from_slice(&port.to_be_bytes());
-            buf.extend_from_slice(data);
-            buf
-        }
-        Ok(std::net::IpAddr::V6(ip)) => {
-            let mut buf = Vec::with_capacity(4 + 16 + 2 + data.len());
-            buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x04]);
-            buf.extend_from_slice(&ip.octets());
-            buf.extend_from_slice(&port.to_be_bytes());
-            buf.extend_from_slice(data);
-            buf
-        }
-        Err(_) => {
-            let hb = host.as_bytes();
-            let mut buf = Vec::with_capacity(4 + 1 + hb.len() + 2 + data.len());
-            buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x03]);
-            buf.push(hb.len() as u8);
-            buf.extend_from_slice(hb);
-            buf.extend_from_slice(&port.to_be_bytes());
-            buf.extend_from_slice(data);
-            buf
-        }
-    }
 }
 
 async fn socks5_handshake(stream: &mut TcpStream, proxy_user: Option<&str>, proxy_pass: Option<&str>) -> std::io::Result<(String, u16, u8)> {
@@ -621,7 +549,7 @@ async fn handle_socks_udp_relay(
 }
 
 async fn handle_socks_client(mut client: TcpStream, cli: Arc<CliInner>, pool: Arc<PooledTunnelOpener>) {
-    let session_id = next_session_id();
+    let session_id = next_session_id(&SESSION_COUNTER);
     let peer = client.peer_addr().ok();
     set_socket_opts(&client);
 
@@ -674,42 +602,8 @@ async fn handle_socks_client(mut client: TcpStream, cli: Arc<CliInner>, pool: Ar
     relay_bidirectional(client, tunnel).await;
 }
 
-fn check_http_basic_auth(header: &[u8], user: &str, pass: &str) -> bool {
-    let s = String::from_utf8_lossy(header);
-    for line in s.lines() {
-        if line.to_lowercase().starts_with("proxy-authorization:") {
-            let value = line.split(':').nth(1).unwrap_or("").trim();
-            if value.to_lowercase().starts_with("basic ") {
-                let b64 = value[6..].trim();
-                if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64) {
-                    if let Ok(ds) = String::from_utf8(decoded) {
-                        let parts: Vec<&str> = ds.splitn(2, ':').collect();
-                        if parts.len() == 2 && parts[0] == user && parts[1] == pass { return true; }
-                    }
-                }
-            }
-            break;
-        }
-    }
-    false
-}
-
-fn parse_http_connect_target(header: &[u8]) -> std::io::Result<(String, u16)> {
-    let s = String::from_utf8_lossy(header);
-    let first_line = s.lines().next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty request"))?;
-    let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
-    if parts.len() < 3 || !parts[0].eq_ignore_ascii_case("CONNECT") {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not CONNECT"));
-    }
-    let target = parts[1];
-    let sep = target.rfind(':').ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad target"))?;
-    let host = target[..sep].to_string();
-    let port: u16 = target[sep+1..].parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad port"))?;
-    Ok((host, port))
-}
-
 async fn handle_http_client(mut client: TcpStream, cli: Arc<CliInner>, pool: Arc<PooledTunnelOpener>) {
-    let session_id = next_session_id();
+    let session_id = next_session_id(&SESSION_COUNTER);
     let peer = client.peer_addr().ok();
     set_socket_opts(&client);
 
@@ -774,31 +668,8 @@ async fn handle_http_client(mut client: TcpStream, cli: Arc<CliInner>, pool: Arc
     relay_bidirectional(client, tunnel).await;
 }
 
-fn parse_tcp_line_target(line: &[u8]) -> std::io::Result<(String, u16)> {
-    let s = String::from_utf8_lossy(line).trim().to_string();
-    if s.is_empty() {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "empty target"));
-    }
-    if let Some(sep) = s.rfind(':') {
-        let host = s[..sep].trim().to_string();
-        let port_s = s[sep+1..].trim();
-        let port: u16 = port_s.parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad port"))?;
-        if host.is_empty() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "empty host")); }
-        if port == 0 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad port")); }
-        return Ok((host, port));
-    }
-    let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.len() == 2 {
-        let host = parts[0].to_string();
-        let port: u16 = parts[1].parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad port"))?;
-        if port == 0 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad port")); }
-        return Ok((host, port));
-    }
-    Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "expected host:port"))
-}
-
 async fn handle_tcp_line_client(mut client: TcpStream, cli: Arc<CliInner>, pool: Arc<PooledTunnelOpener>) {
-    let session_id = next_session_id();
+    let session_id = next_session_id(&SESSION_COUNTER);
     let peer = client.peer_addr().ok();
     set_socket_opts(&client);
 

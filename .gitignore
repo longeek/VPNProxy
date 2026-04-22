@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.log
+.coverage
+.pytest_cache/
+dist/
+certs/server.key
+vpn-proxy-go/client.exe
+vpn-proxy-go/vpn-proxy-server
+vpn-proxy-go/server.exe

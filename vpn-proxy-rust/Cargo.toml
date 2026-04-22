@@ -3,6 +3,10 @@ name = "vpn-proxy"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "vpn_proxy"
+path = "src/lib.rs"
+
 [[bin]]
 name = "vpn-proxy-server"
 path = "src/server.rs"
@@ -26,6 +30,10 @@ base64 = "0.22"
 rand = "0.8"
 rustls-native-certs = "0.7"
 ipnet = "2"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

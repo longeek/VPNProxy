@@ -9,17 +9,13 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, info, warn, Level};
 use tracing_subscriber::EnvFilter;
 
-const RECV_BUF_SIZE: usize = 256 * 1024;
-const PIPE_BUF_SIZE: usize = 131072;
-const DRAIN_THRESHOLD: usize = 128 * 1024;
-const UDP_FRAME_VERSION: u8 = 1;
+use vpn_proxy::server_logic::{
+    load_allowed_tokens, next_session_id, pack_udp_frame, parse_allow_cidrs,
+    parse_bootstrap_line, peer_allowed, BootstrapInfo,
+    DRAIN_THRESHOLD, PIPE_BUF_SIZE, RECV_BUF_SIZE, UDP_FRAME_VERSION,
+};
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn next_session_id() -> String {
-    let id = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{:08x}", id)
-}
 
 #[derive(Parser)]
 #[command(name = "vpn-proxy-server", about = "TLS tunnel proxy server")]
@@ -48,39 +44,8 @@ struct Cli {
     log_level: String,
 }
 
-fn load_allowed_tokens(cli: &Cli) -> Vec<String> {
-    let mut tokens = Vec::new();
-    if let Some(ref t) = cli.token {
-        tokens.push(t.clone());
-    }
-    if let Some(ref path) = cli.tokens_file {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                    tokens.push(trimmed.to_string());
-                }
-            }
-        }
-    }
-    tokens
-}
-
-fn parse_allow_cidrs(value: &str) -> Vec<ipnet::IpNet> {
-    if value.is_empty() {
-        return vec![];
-    }
-    value
-        .split(',')
-        .filter_map(|s| s.trim().parse().ok())
-        .collect()
-}
-
-fn peer_allowed(peer_ip: std::net::IpAddr, networks: &[ipnet::IpNet]) -> bool {
-    if networks.is_empty() {
-        return true;
-    }
-    networks.iter().any(|net| net.contains(&peer_ip))
+fn load_tokens_cli(cli: &Cli) -> Vec<String> {
+    load_allowed_tokens(cli.token.as_deref(), cli.tokens_file.as_deref())
 }
 
 fn set_socket_opts(stream: &TcpStream) {
@@ -91,36 +56,20 @@ fn set_socket_opts(stream: &TcpStream) {
 }
 
 #[derive(Debug)]
-struct BootstrapInfo {
+struct BootstrapInfo_ {
     host: String,
     port: u16,
     proto: String,
 }
 
-fn parse_bootstrap_line(line: &str, allowed_tokens: &[String]) -> Result<BootstrapInfo, String> {
-    let payload: serde_json::Value = serde_json::from_str(line).map_err(|e| format!("invalid json: {e}"))?;
-    let token = payload.get("auth").and_then(|v| v.as_str()).ok_or("missing auth")?;
-    if !allowed_tokens.iter().any(|t| t == token) {
-        return Err("ERR auth".to_string());
+impl From<BootstrapInfo> for BootstrapInfo_ {
+    fn from(b: BootstrapInfo) -> Self {
+        BootstrapInfo_ { host: b.host, port: b.port, proto: b.proto }
     }
-    let host = payload.get("host").and_then(|v| v.as_str()).ok_or("missing host")?.to_string();
-    let port = payload.get("port").and_then(|v| v.as_u64()).ok_or("missing port")?;
-    let proto = payload.get("proto").and_then(|v| v.as_str()).unwrap_or("tcp").to_string();
-    if proto != "tcp" && proto != "udp" {
-        return Err("invalid proto".to_string());
-    }
-    if port > 65535 {
-        return Err("invalid port".to_string());
-    }
-    if proto == "tcp" && port == 0 {
-        return Err("invalid port".to_string());
-    }
-    if proto == "udp" && host == "0.0.0.0" && port == 0 {
-        // multi-destination UDP relay
-    } else if proto == "udp" && port < 1 {
-        return Err("invalid port".to_string());
-    }
-    Ok(BootstrapInfo { host, port: port as u16, proto })
+}
+
+fn parse_bootstrap(line: &str, allowed_tokens: &[String]) -> Result<BootstrapInfo_, String> {
+    parse_bootstrap_line(line, allowed_tokens).map(Into::into)
 }
 
 struct SessionStats {
@@ -138,19 +87,6 @@ impl SessionStats {
 }
 
 type TlsStream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
-
-fn pack_udp_frame(host: &str, port: u16, data: &[u8]) -> Vec<u8> {
-    let hb = host.as_bytes();
-    let mut buf = Vec::with_capacity(4 + hb.len() + 4 + data.len());
-    buf.push(UDP_FRAME_VERSION);
-    buf.push(0);
-    buf.extend_from_slice(&(hb.len() as u16).to_be_bytes());
-    buf.extend_from_slice(hb);
-    buf.extend_from_slice(&port.to_be_bytes());
-    buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
-    buf.extend_from_slice(data);
-    buf
-}
 
 struct UdpFrameHeader {
     host: String,
@@ -443,7 +379,7 @@ struct AppContext {
 }
 
 async fn handle_client(tls_stream: TlsStream, ctx: Arc<AppContext>) {
-    let session_id = next_session_id();
+    let session_id = next_session_id(&SESSION_COUNTER);
     let peer = tls_stream.get_ref().0.peer_addr().ok();
     let stats = Arc::new(SessionStats::new());
 
@@ -496,7 +432,7 @@ async fn handle_client(tls_stream: TlsStream, ctx: Arc<AppContext>) {
     let line = String::from_utf8_lossy(&line_buf[..newline_pos]);
     let line_trimmed = line.trim_end_matches('\r');
 
-    let info = match parse_bootstrap_line(line_trimmed, &ctx.allowed_tokens) {
+    let info = match parse_bootstrap(line_trimmed, &ctx.allowed_tokens) {
         Ok(i) => i,
         Err(e) => {
             warn!("[sid={session_id}] bootstrap error from {:?}: {e}", peer);
@@ -562,7 +498,7 @@ async fn main() {
 
     let cert_path = cli.cert.clone().unwrap_or_else(|| "./certs/server.crt".to_string());
     let key_path = cli.key.clone().unwrap_or_else(|| "./certs/server.key".to_string());
-    let allowed_tokens = Arc::new(load_allowed_tokens(&cli));
+    let allowed_tokens = Arc::new(load_tokens_cli(&cli));
     let allow_networks = parse_allow_cidrs(&cli.allow_cidrs);
     let connect_timeout = Duration::from_secs_f64(cli.connect_timeout);
     let bootstrap_timeout = Duration::from_secs_f64(cli.bootstrap_timeout);
