@@ -70,7 +70,7 @@ func (h *Handler) Handle(client net.Conn) {
 
 	client.Write([]byte("OK\n"))
 	log.Printf("TCP tunnel OK -> %s:%d", targetHost, targetPort)
-	tunnel.RelayBidirectional(client, tunnelConn)
+	tunnel.RelayBidirectional(client, tunnelConn, nil, nil)
 }
 
 func containsNewline(buf []byte) bool {

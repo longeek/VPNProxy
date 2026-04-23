@@ -9,6 +9,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 func ReadFromStream(r io.Reader) (*UdpFrame, error) {
@@ -47,9 +48,72 @@ func ReadFromStream(r io.Reader) (*UdpFrame, error) {
 }
 
 func WriteToStream(w io.Writer, host string, port uint16, data []byte) error {
-	packed := Pack(host, port, data)
-	_, err := w.Write(packed)
-	return err
+	hb := []byte(host)
+	var hdr [4]byte
+	hdr[0] = Version
+	hdr[1] = 0
+	binary.BigEndian.PutUint16(hdr[2:4], uint16(len(hb)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	if _, err := w.Write(hb); err != nil {
+		return err
+	}
+	var pd [4]byte
+	binary.BigEndian.PutUint16(pd[0:2], port)
+	binary.BigEndian.PutUint16(pd[2:4], uint16(len(data)))
+	if _, err := w.Write(pd[:]); err != nil {
+		return err
+	}
+	if len(data) > 0 {
+		if _, err := w.Write(data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+var readBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 65535+4+1024+4)
+		return &b
+	},
+}
+
+func ReadFromStreamPooled(r io.Reader) (*UdpFrame, error) {
+	bufPtr := readBufPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer readBufPool.Put(bufPtr)
+
+	if _, err := io.ReadFull(r, buf[:4]); err != nil {
+		return nil, err
+	}
+	if buf[0] != Version {
+		return nil, ErrBadVersion
+	}
+	nlen := int(binary.BigEndian.Uint16(buf[2:4]))
+	if nlen == 0 || nlen > 1024 {
+		return nil, ErrBadHostLen
+	}
+	if _, err := io.ReadFull(r, buf[4:4+nlen]); err != nil {
+		return nil, err
+	}
+	host := string(buf[4:4+nlen])
+	if _, err := io.ReadFull(r, buf[4+nlen:4+nlen+4]); err != nil {
+		return nil, err
+	}
+	port := binary.BigEndian.Uint16(buf[4+nlen:4+nlen+2])
+	dlen := int(binary.BigEndian.Uint16(buf[4+nlen+2:4+nlen+4]))
+	if dlen > 65535 {
+		return nil, ErrBadPayloadLen
+	}
+	dataStart := 4 + nlen + 4
+	if _, err := io.ReadFull(r, buf[dataStart:dataStart+dlen]); err != nil {
+		return nil, err
+	}
+	data := make([]byte, dlen)
+	copy(data, buf[dataStart:dataStart+dlen])
+	return &UdpFrame{Host: host, Port: port, Data: data}, nil
 }
 
 func SocksUdpParseRequest(packet []byte) (host string, port uint16, payload []byte, err error) {

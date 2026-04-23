@@ -3,6 +3,7 @@ package frame
 import (
 	"encoding/binary"
 	"errors"
+	"io"
 )
 
 const Version = 1
@@ -32,6 +33,32 @@ func Pack(host string, port uint16, data []byte) []byte {
 	binary.BigEndian.PutUint16(buf[off+2:off+4], uint16(len(data)))
 	copy(buf[off+4:], data)
 	return buf
+}
+
+func PackTo(w io.Writer, host string, port uint16, data []byte) (int, error) {
+	hb := []byte(host)
+	var hdr [4]byte
+	hdr[0] = Version
+	hdr[1] = 0
+	binary.BigEndian.PutUint16(hdr[2:4], uint16(len(hb)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return 0, err
+	}
+	if _, err := w.Write(hb); err != nil {
+		return 0, err
+	}
+	var pd [4]byte
+	binary.BigEndian.PutUint16(pd[0:2], port)
+	binary.BigEndian.PutUint16(pd[2:4], uint16(len(data)))
+	if _, err := w.Write(pd[:]); err != nil {
+		return 0, err
+	}
+	if len(data) > 0 {
+		if _, err := w.Write(data); err != nil {
+			return 0, err
+		}
+	}
+	return 4 + len(hb) + 4 + len(data), nil
 }
 
 func ReadFromSlice(buf []byte) (*UdpFrame, int, error) {

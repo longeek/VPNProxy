@@ -92,7 +92,7 @@ func (h *Handler) Handle(client net.Conn) {
 
 	client.Write(resp200)
 	log.Printf("HTTP CONNECT OK to %s:%d", targetHost, targetPort)
-	tunnel.RelayBidirectional(client, tunnelConn)
+	tunnel.RelayBidirectional(client, tunnelConn, nil, nil)
 }
 
 func setSocketOpts(conn net.Conn) {

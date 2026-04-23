@@ -1,12 +1,14 @@
 package socks
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 
 	"vpn-proxy-go/internal/frame"
@@ -59,7 +61,7 @@ func (h *Handler) Handle(client net.Conn) {
 
 	sendSocksReply(client, 0x00)
 	log.Printf("SOCKS CONNECT OK to %s:%d", targetHost, targetPort)
-	tunnel.RelayBidirectional(client, tunnelConn)
+	tunnel.RelayBidirectional(client, tunnelConn, nil, nil)
 }
 
 func (h *Handler) handshake(client net.Conn) (host string, port uint16, cmd byte, err error) {
@@ -184,25 +186,35 @@ func (h *Handler) handleUDP(client net.Conn, targetHost string, targetPort uint1
 
 	sendSocksReplyBound(client, 0x00, "127.0.0.1", bindPort)
 
-	pending := sync.Map{}
+	pendingMu := sync.Mutex{}
+	pending := map[string][]net.UDPAddr{}
+
 	var tunnelWriteMu sync.Mutex
+	bw := bufio.NewWriterSize(tunnelConn, tunnel.PipeBufSize)
+	pendingWrite := 0
 
 	go func() {
 		for {
-			f, err := frame.ReadFromStream(tunnelConn)
+			f, err := frame.ReadFromStreamPooled(tunnelConn)
 			if err != nil {
 				break
 			}
 			pkt := frame.SocksUdpBuildReply(f.Host, f.Port, f.Data)
-			key := fmt.Sprintf("%s:%d", f.Host, f.Port)
-			if v, ok := pending.LoadAndDelete(key); ok {
-				entries := v.([]net.UDPAddr)
-				if len(entries) > 0 {
-					udpSock.WriteToUDP(pkt, &entries[0])
-					if len(entries) > 1 {
-						pending.Store(key, entries[1:])
-					}
+			key := f.Host + ":" + strconv.Itoa(int(f.Port))
+			pendingMu.Lock()
+			entries, ok := pending[key]
+			if ok && len(entries) > 0 {
+				addr := entries[0]
+				if len(entries) > 1 {
+					pending[key] = entries[1:]
+				} else {
+					delete(pending, key)
 				}
+				pendingMu.Unlock()
+				udpSock.WriteToUDP(pkt, &addr)
+			} else {
+				delete(pending, key)
+				pendingMu.Unlock()
 			}
 		}
 	}()
@@ -217,18 +229,29 @@ func (h *Handler) handleUDP(client net.Conn, targetHost string, targetPort uint1
 		if err != nil {
 			continue
 		}
-		fr := frame.Pack(h, p, payload)
-		key := fmt.Sprintf("%s:%d", h, p)
-		existing, _ := pending.LoadOrStore(key, []net.UDPAddr{})
-		entries := existing.([]net.UDPAddr)
-		entries = append(entries, *srcAddr)
-		pending.Store(key, entries)
+
+		pendingMu.Lock()
+		key := h + ":" + strconv.Itoa(int(p))
+		pending[key] = append(pending[key], *srcAddr)
+		pendingMu.Unlock()
 
 		tunnelWriteMu.Lock()
-		tunnelConn.Write(fr)
+		packedLen, werr := frame.PackTo(bw, h, p, payload)
+		if werr != nil {
+			tunnelWriteMu.Unlock()
+			break
+		}
+		pendingWrite += packedLen
+		if pendingWrite >= tunnel.DrainThreshold {
+			bw.Flush()
+			pendingWrite = 0
+		}
 		tunnelWriteMu.Unlock()
 	}
 
+	if pendingWrite > 0 {
+		bw.Flush()
+	}
 	udpSock.Close()
 	tunnelConn.Close()
 }

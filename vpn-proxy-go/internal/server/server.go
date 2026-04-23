@@ -2,10 +2,10 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -15,23 +15,30 @@ import (
 	"time"
 
 	"vpn-proxy-go/internal/frame"
+	"vpn-proxy-go/internal/tunnel"
+)
+
+const (
+	recvBufSize    = 256 * 1024
+	pipeBufSize    = 131072
+	drainThreshold = 128 * 1024
 )
 
 var sessionCounter uint64
 
+const hexTable = "0123456789abcdef"
+
 func nextSessionID() string {
 	id := atomic.AddUint64(&sessionCounter, 1)
-	return fmt.Sprintf("%08x", id)
+	b := make([]byte, 8)
+	for i := 7; i >= 0; i-- {
+		b[i] = hexTable[id&0xf]
+		id >>= 4
+	}
+	return string(b)
 }
 
-type BootstrapInfo struct {
-	Auth  string `json:"auth"`
-	Host  string `json:"host"`
-	Port  uint16 `json:"port"`
-	Proto string `json:"proto"`
-}
-
-func parseBootstrapLine(line string, allowedTokens []string) (host string, port uint16, proto string, err error) {
+func parseBootstrapLine(line string, allowedTokens map[string]bool) (host string, port uint16, proto string, err error) {
 	var payload map[string]interface{}
 	if e := json.Unmarshal([]byte(line), &payload); e != nil {
 		return "", 0, "", fmt.Errorf("invalid json: %v", e)
@@ -40,14 +47,7 @@ func parseBootstrapLine(line string, allowedTokens []string) (host string, port 
 	if !ok {
 		return "", 0, "", fmt.Errorf("missing auth")
 	}
-	found := false
-	for _, t := range allowedTokens {
-		if t == authVal {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !allowedTokens[authVal] {
 		return "", 0, "", fmt.Errorf("ERR auth")
 	}
 	hostVal, ok := payload["host"].(string)
@@ -72,10 +72,10 @@ func parseBootstrapLine(line string, allowedTokens []string) (host string, port 
 	return hostVal, p, protoVal, nil
 }
 
-func LoadAllowedTokens(token string, tokensFile string) []string {
-	tokens := []string{}
+func LoadAllowedTokens(token string, tokensFile string) map[string]bool {
+	tokens := map[string]bool{}
 	if token != "" {
-		tokens = append(tokens, token)
+		tokens[token] = true
 	}
 	if tokensFile != "" {
 		f, err := os.Open(tokensFile)
@@ -84,7 +84,7 @@ func LoadAllowedTokens(token string, tokensFile string) []string {
 			for scanner.Scan() {
 				trimmed := strings.TrimSpace(scanner.Text())
 				if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
-					tokens = append(tokens, trimmed)
+					tokens[trimmed] = true
 				}
 			}
 			f.Close()
@@ -121,16 +121,13 @@ func peerAllowed(peerIP net.IP, networks []*net.IPNet) bool {
 }
 
 type AppConfig struct {
-	AllowedTokens    []string
+	AllowedTokens    map[string]bool
 	AllowNetworks    []*net.IPNet
 	ConnectTimeout   time.Duration
 	BootstrapTimeout time.Duration
 }
 
-type SessionStats struct {
-	uploadBytes   uint64
-	downloadBytes uint64
-}
+
 
 func readBootstrapLine(conn net.Conn, timeout time.Duration) (string, error) {
 	lineBuf := make([]byte, 4096)
@@ -148,38 +145,77 @@ func readBootstrapLine(conn net.Conn, timeout time.Duration) (string, error) {
 		if n == 0 {
 			return "", fmt.Errorf("connection closed")
 		}
+		prevTotal := total
 		total += n
-		for i := 0; i < total; i++ {
-			if lineBuf[i] == '\n' {
-				line := strings.TrimRight(string(lineBuf[:i]), "\r")
-				conn.SetReadDeadline(time.Time{})
-				return line, nil
+		idx := bytes.IndexByte(lineBuf[prevTotal:total], '\n')
+		if idx >= 0 {
+			line := string(bytes.TrimRight(lineBuf[:prevTotal+idx], "\r"))
+			conn.SetReadDeadline(time.Time{})
+			return line, nil
+		}
+	}
+}
+
+type dnsEntry struct {
+	ip net.IP
+	ts time.Time
+}
+
+var dnsCache sync.Map
+
+const dnsCacheTTL = 30 * time.Second
+
+func cachedLookupHost(host string) net.IP {
+	now := time.Now()
+	if v, ok := dnsCache.Load(host); ok {
+		e := v.(*dnsEntry)
+		if now.Sub(e.ts) < dnsCacheTTL {
+			return e.ip
+		}
+		dnsCache.Delete(host)
+	}
+
+	addrs, err := net.LookupHost(host)
+	if err != nil {
+		return nil
+	}
+	var ip net.IP
+	for _, a := range addrs {
+		p := net.ParseIP(a)
+		if p != nil && p.To4() != nil {
+			ip = p
+			break
+		}
+	}
+	if ip == nil {
+		for _, a := range addrs {
+			p := net.ParseIP(a)
+			if p != nil {
+				ip = p
+				break
 			}
 		}
 	}
+	if ip != nil {
+		dnsCache.Store(host, &dnsEntry{ip: ip, ts: now})
+	}
+	return ip
 }
 
 func resolveHost(host string, port uint16) (string, error) {
-	addrs, err := net.LookupHost(host)
-	if err != nil {
-		return "", err
+	ip := cachedLookupHost(host)
+	if ip == nil {
+		return "", fmt.Errorf("no address found for %s", host)
 	}
-	for _, a := range addrs {
-		ip := net.ParseIP(a)
-		if ip != nil && ip.To4() != nil {
-			return fmt.Sprintf("%s:%d", a, port), nil
-		}
-	}
-	for _, a := range addrs {
-		ip := net.ParseIP(a)
-		if ip != nil {
-			return fmt.Sprintf("%s:%d", a, port), nil
-		}
-	}
-	return "", fmt.Errorf("no address found for %s", host)
+	return fmt.Sprintf("%s:%d", ip.String(), port), nil
 }
 
-func handleTCPRelay(tlsConn net.Conn, targetAddr string, stats *SessionStats, sessionID string, connectTimeout time.Duration) {
+func handleTCPRelay(tlsConn net.Conn, host string, port uint16, stats *tunnel.SessionStats, sessionID string, connectTimeout time.Duration) {
+	targetAddr, err := resolveHost(host, port)
+	if err != nil {
+		log.Printf("[sid=%s] DNS lookup failed for %s:%d: %v", sessionID, host, port, err)
+		return
+	}
 	target, err := net.DialTimeout("tcp", targetAddr, connectTimeout)
 	if err != nil {
 		log.Printf("[sid=%s] backend connect failed to %s: %v", sessionID, targetAddr, err)
@@ -187,38 +223,25 @@ func handleTCPRelay(tlsConn net.Conn, targetAddr string, stats *SessionStats, se
 	}
 	if tcpConn, ok := target.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
-		tcpConn.SetReadBuffer(256 * 1024)
-		tcpConn.SetWriteBuffer(256 * 1024)
+		tcpConn.SetReadBuffer(recvBufSize)
+		tcpConn.SetWriteBuffer(recvBufSize)
 	}
 
-	var upBytes, downBytes uint64
-	done := make(chan struct{}, 2)
+	tunnel.RelayTCPServer(tlsConn, target, stats)
 
-	go func() {
-		n, _ := io.Copy(target, tlsConn)
-		upBytes = uint64(n)
-		target.Close()
-		done <- struct{}{}
-	}()
-
-	go func() {
-		n, _ := io.Copy(tlsConn, target)
-		downBytes = uint64(n)
-		tlsConn.Close()
-		done <- struct{}{}
-	}()
-
-	<-done
-	<-done
-
-	atomic.AddUint64(&stats.uploadBytes, upBytes)
-	atomic.AddUint64(&stats.downloadBytes, downBytes)
-	totalUp := atomic.LoadUint64(&stats.uploadBytes)
-	totalDown := atomic.LoadUint64(&stats.downloadBytes)
+	totalUp := stats.UploadBytes.Load()
+	totalDown := stats.DownloadBytes.Load()
 	log.Printf("[sid=%s] session closed (up=%d bytes, down=%d bytes)", sessionID, totalUp, totalDown)
 }
 
-func handleUDPRelay(tlsConn net.Conn, stats *SessionStats, host string, port uint16, sessionID string) {
+var udpBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 65535)
+		return &b
+	},
+}
+
+func handleUDPRelay(tlsConn net.Conn, stats *tunnel.SessionStats, host string, port uint16, sessionID string) {
 	udpSock, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: 0})
 	if err != nil {
 		log.Printf("[sid=%s] UDP bind failed: %v", sessionID, err)
@@ -237,10 +260,12 @@ func handleUDPRelay(tlsConn net.Conn, stats *SessionStats, host string, port uin
 	tlsConn.Write([]byte("OK\n"))
 
 	var tunnelWriteMu sync.Mutex
+	bw := bufio.NewWriterSize(tlsConn, pipeBufSize)
+	pendingWrite := 0
 
 	go func() {
 		for {
-			f, err := frame.ReadFromStream(tlsConn)
+			f, err := frame.ReadFromStreamPooled(tlsConn)
 			if err != nil {
 				break
 			}
@@ -250,31 +275,18 @@ func handleUDPRelay(tlsConn net.Conn, stats *SessionStats, host string, port uin
 				sendHost = fixedHost
 				sendPort = fixedPort
 			}
-			addrs, err := net.LookupHost(sendHost)
-			if err != nil {
-				continue
-			}
-			var targetIP net.IP
-			for _, a := range addrs {
-				ip := net.ParseIP(a)
-				if ip != nil {
-					if ip.To4() != nil {
-						targetIP = ip
-						break
-					}
-					targetIP = ip
-				}
-			}
+			targetIP := cachedLookupHost(sendHost)
 			if targetIP == nil {
 				continue
 			}
 			udpAddr := &net.UDPAddr{IP: targetIP, Port: int(sendPort)}
 			udpSock.WriteToUDP(f.Data, udpAddr)
-			atomic.AddUint64(&stats.uploadBytes, uint64(len(f.Data)+4+len(f.Host)+4))
+			stats.UploadBytes.Add(uint64(len(f.Data)+4+len(f.Host)+4))
 		}
 	}()
 
-	buf := make([]byte, 65535)
+	buf := *udpBufPool.Get().(*[]byte)
+	defer udpBufPool.Put(&buf)
 	for {
 		n, srcAddr, err := udpSock.ReadFromUDP(buf)
 		if err != nil {
@@ -282,21 +294,43 @@ func handleUDPRelay(tlsConn net.Conn, stats *SessionStats, host string, port uin
 		}
 		srcHost := srcAddr.IP.String()
 		srcPort := uint16(srcAddr.Port)
-		packed := frame.Pack(srcHost, srcPort, buf[:n])
 
 		tunnelWriteMu.Lock()
-		tlsConn.Write(packed)
+		packedLen, werr := frame.PackTo(bw, srcHost, srcPort, buf[:n])
+		if werr != nil {
+			tunnelWriteMu.Unlock()
+			break
+		}
+		pendingWrite += packedLen
+		if pendingWrite >= drainThreshold {
+			bw.Flush()
+			pendingWrite = 0
+		}
 		tunnelWriteMu.Unlock()
 
-		atomic.AddUint64(&stats.downloadBytes, uint64(len(packed)))
+		stats.DownloadBytes.Add(uint64(packedLen))
 	}
 
+	if pendingWrite > 0 {
+		bw.Flush()
+	}
 	udpSock.Close()
 	tlsConn.Close()
 
-	totalUp := atomic.LoadUint64(&stats.uploadBytes)
-	totalDown := atomic.LoadUint64(&stats.downloadBytes)
+	totalUp := stats.UploadBytes.Load()
+	totalDown := stats.DownloadBytes.Load()
 	log.Printf("[sid=%s] UDP session closed (up=%d bytes, down=%d bytes)", sessionID, totalUp, totalDown)
+}
+
+func setClientSocketOpts(tlsConn net.Conn) {
+	if tc, ok := tlsConn.(*tls.Conn); ok {
+		raw, ok := tc.NetConn().(*net.TCPConn)
+		if ok {
+			raw.SetNoDelay(true)
+			raw.SetReadBuffer(recvBufSize)
+			raw.SetWriteBuffer(recvBufSize)
+		}
+	}
 }
 
 func handleClient(tlsConn net.Conn, ctx *AppConfig) {
@@ -304,11 +338,9 @@ func handleClient(tlsConn net.Conn, ctx *AppConfig) {
 	defer tlsConn.Close()
 
 	peer := tlsConn.RemoteAddr()
-	stats := &SessionStats{}
+	stats := &tunnel.SessionStats{}
 
-	if tcpConn, ok := tlsConn.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true)
-	}
+	setClientSocketOpts(tlsConn)
 
 	if peer != nil {
 		peerAddr, ok := peer.(*net.TCPAddr)
@@ -341,13 +373,8 @@ func handleClient(tlsConn net.Conn, ctx *AppConfig) {
 	if proto == "udp" {
 		handleUDPRelay(tlsConn, stats, host, port, sessionID)
 	} else {
-		targetAddr, err := resolveHost(host, port)
-		if err != nil {
-			log.Printf("[sid=%s] DNS lookup failed for %s:%d: %v", sessionID, host, port, err)
-			return
-		}
 		tlsConn.Write([]byte("OK\n"))
-		handleTCPRelay(tlsConn, targetAddr, stats, sessionID, ctx.ConnectTimeout)
+		handleTCPRelay(tlsConn, host, port, stats, sessionID, ctx.ConnectTimeout)
 	}
 }
 
@@ -358,8 +385,11 @@ func Run(cfg *AppConfig, certPath, keyPath, listenAddr string) {
 	}
 
 	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+		Certificates:     []tls.Certificate{cert},
+		MinVersion:       tls.VersionTLS12,
+		CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256},
+		ClientSessionCache: tls.NewLRUClientSessionCache(128),
+		SessionTicketsDisabled: false,
 	}
 
 	ln, err := net.Listen("tcp", listenAddr)

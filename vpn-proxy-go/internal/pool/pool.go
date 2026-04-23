@@ -3,9 +3,11 @@ package pool
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"vpn-proxy-go/internal/tunnel"
@@ -38,15 +40,27 @@ func (p *Pool) Start(ctx context.Context) {
 	p.mu.Lock()
 	p.closed = false
 	p.mu.Unlock()
+
+	var wg sync.WaitGroup
+	var localMu sync.Mutex
+	var localEntries []entry
 	for i := 0; i < p.maxSize; i++ {
-		conn, err := tunnel.Open(ctx, p.cfg, "0.0.0.0", 1, "tcp")
-		if err != nil {
-			break
-		}
-		p.mu.Lock()
-		p.entries = append(p.entries, entry{conn: conn, created: time.Now()})
-		p.mu.Unlock()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := tunnel.Open(ctx, p.cfg, "0.0.0.0", 1, "tcp")
+			if err == nil {
+				localMu.Lock()
+				localEntries = append(localEntries, entry{conn: conn, created: time.Now()})
+				localMu.Unlock()
+			}
+		}()
 	}
+	wg.Wait()
+
+	p.mu.Lock()
+	p.entries = localEntries
+	p.mu.Unlock()
 	go p.refillLoop(ctx)
 }
 
@@ -63,15 +77,16 @@ func (p *Pool) refillLoop(ctx context.Context) {
 			return
 		}
 		now := time.Now()
-		fresh := make([]entry, 0, len(p.entries))
-		for _, e := range p.entries {
-			if now.Sub(e.created) < p.ttl {
-				fresh = append(fresh, e)
+		n := 0
+		for i := 0; i < len(p.entries); i++ {
+			if now.Sub(p.entries[i].created) < p.ttl {
+				p.entries[n] = p.entries[i]
+				n++
 			} else {
-				e.conn.Close()
+				p.entries[i].conn.Close()
 			}
 		}
-		p.entries = fresh
+		p.entries = p.entries[:n]
 		need := p.maxSize - len(p.entries)
 		p.mu.Unlock()
 
@@ -87,47 +102,66 @@ func (p *Pool) refillLoop(ctx context.Context) {
 }
 
 func (p *Pool) Acquire(ctx context.Context, targetHost string, targetPort uint16, proto string) (net.Conn, error) {
-	p.mu.Lock()
-	now := time.Now()
-	for len(p.entries) > 0 {
-		e := p.entries[len(p.entries)-1]
-		p.entries = p.entries[:len(p.entries)-1]
-		if now.Sub(e.created) < p.ttl {
-			payload := tunnel.BootstrapInfo{
-				Auth:  p.cfg.Token,
-				Host:  targetHost,
-				Port:  targetPort,
-				Proto: proto,
-			}
-			if proto == "tcp" {
-				payload.Proto = ""
-			}
-			bs, _ := json.Marshal(payload)
-			bs = append(bs, '\n')
-			if _, err := e.conn.Write(bs); err != nil {
-				e.conn.Close()
-				continue
-			}
-			statusBuf := make([]byte, 64)
-			n, readErr := e.conn.Read(statusBuf)
-			if readErr != nil {
-				e.conn.Close()
-				continue
-			}
-			status := string(statusBuf[:n])
-			if strings.HasPrefix(status, "OK") {
-				p.hits++
-				p.mu.Unlock()
-				return e.conn, nil
-			}
-			e.conn.Close()
+	for {
+		candidate := p.popEntry()
+		if candidate == nil {
+			break
+		}
+		if time.Since(candidate.created) >= p.ttl {
+			candidate.conn.Close()
 			continue
 		}
-		e.conn.Close()
+		result, err := p.bootstrap(candidate.conn, targetHost, targetPort, proto)
+		if err != nil {
+			candidate.conn.Close()
+			continue
+		}
+		if result {
+			atomic.AddUint64(&p.hits, 1)
+			return candidate.conn, nil
+		}
+		candidate.conn.Close()
 	}
-	p.mu.Unlock()
 
 	return tunnel.Open(ctx, p.cfg, targetHost, targetPort, proto)
+}
+
+func (p *Pool) popEntry() *entry {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.entries) == 0 {
+		return nil
+	}
+	e := p.entries[len(p.entries)-1]
+	p.entries = p.entries[:len(p.entries)-1]
+	return &e
+}
+
+func (p *Pool) bootstrap(conn net.Conn, targetHost string, targetPort uint16, proto string) (bool, error) {
+	payload := tunnel.BootstrapInfo{
+		Auth:  p.cfg.Token,
+		Host:  targetHost,
+		Port:  targetPort,
+		Proto: proto,
+	}
+	if proto == "tcp" {
+		payload.Proto = ""
+	}
+	bs, _ := json.Marshal(payload)
+	bs = append(bs, '\n')
+	if _, err := conn.Write(bs); err != nil {
+		return false, err
+	}
+	statusBuf := make([]byte, 128)
+	n, err := conn.Read(statusBuf)
+	if err != nil {
+		return false, err
+	}
+	status := string(statusBuf[:n])
+	if strings.HasPrefix(status, "OK") {
+		return true, nil
+	}
+	return false, fmt.Errorf("server refused: %s", strings.TrimSpace(status))
 }
 
 func (p *Pool) Stop() {
