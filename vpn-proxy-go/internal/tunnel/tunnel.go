@@ -146,6 +146,24 @@ func putRelayBuf(b []byte) {
 	relayBufPool.Put(&b)
 }
 
+// relayCopy performs efficient unidirectional copy with statistics tracking
+func relayCopy(src, dst net.Conn, stats *uint64, buf []byte) {
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				break
+			}
+			if stats != nil {
+				atomic.AddUint64(stats, uint64(n))
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+}
+
 func RelayBidirectional(client, tunnel net.Conn, upStats, downStats *uint64) {
 	bufUp := getRelayBuf()
 	bufDown := getRelayBuf()
@@ -153,64 +171,14 @@ func RelayBidirectional(client, tunnel net.Conn, upStats, downStats *uint64) {
 
 	go func() {
 		defer putRelayBuf(bufUp)
-		bw := bufio.NewWriterSize(tunnel, PipeBufSize)
-		pending := 0
-		for {
-			n, err := client.Read(bufUp)
-			if n > 0 {
-				if _, werr := bw.Write(bufUp[:n]); werr != nil {
-					break
-				}
-				pending += n
-				if upStats != nil {
-					atomic.AddUint64(upStats, uint64(n))
-				}
-				if pending >= DrainThreshold {
-					if bw.Flush() != nil {
-						break
-					}
-					pending = 0
-				}
-			}
-			if err != nil {
-				break
-			}
-		}
-		if pending > 0 {
-			bw.Flush()
-		}
+		relayCopy(client, tunnel, upStats, bufUp)
 		tunnel.Close()
 		done <- struct{}{}
 	}()
 
 	go func() {
 		defer putRelayBuf(bufDown)
-		bw := bufio.NewWriterSize(client, PipeBufSize)
-		pending := 0
-		for {
-			n, err := tunnel.Read(bufDown)
-			if n > 0 {
-				if _, werr := bw.Write(bufDown[:n]); werr != nil {
-					break
-				}
-				pending += n
-				if downStats != nil {
-					atomic.AddUint64(downStats, uint64(n))
-				}
-				if pending >= DrainThreshold {
-					if bw.Flush() != nil {
-						break
-					}
-					pending = 0
-				}
-			}
-			if err != nil {
-				break
-			}
-		}
-		if pending > 0 {
-			bw.Flush()
-		}
+		relayCopy(tunnel, client, downStats, bufDown)
 		client.Close()
 		done <- struct{}{}
 	}()

@@ -1,3 +1,48 @@
+pub mod dns_cache {
+    use std::collections::HashMap;
+    use std::net::IpAddr;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    struct CacheEntry {
+        ip: Option<IpAddr>,
+        expires_at: Instant,
+    }
+
+    pub struct DnsCache {
+        cache: Mutex<HashMap<String, CacheEntry>>,
+        ttl: Duration,
+    }
+
+    impl DnsCache {
+        pub fn new(ttl: Duration) -> Self {
+            Self {
+                cache: Mutex::new(HashMap::new()),
+                ttl,
+            }
+        }
+
+        pub fn lookup(&self, host: &str) -> Option<IpAddr> {
+            let mut cache = self.cache.lock().unwrap();
+            if let Some(entry) = cache.get(host) {
+                if Instant::now() < entry.expires_at {
+                    return entry.ip;
+                }
+                cache.remove(host);
+            }
+            None
+        }
+
+        pub fn store(&self, host: String, ip: Option<IpAddr>) {
+            let mut cache = self.cache.lock().unwrap();
+            cache.insert(host, CacheEntry {
+                ip,
+                expires_at: Instant::now() + self.ttl,
+            });
+        }
+    }
+}
+
 pub mod server_logic {
     use std::net::IpAddr;
 
@@ -18,8 +63,8 @@ pub mod server_logic {
         if let Some(t) = token {
             tokens.push(t.to_string());
         }
-        if let Some(path) = tokens_file {
-            if let Ok(content) = std::fs::read_to_string(path) {
+        if let Some(path) = tokens_file
+            && let Ok(content) = std::fs::read_to_string(path) {
                 for line in content.lines() {
                     let trimmed = line.trim();
                     if !trimmed.is_empty() && !trimmed.starts_with('#') {
@@ -27,7 +72,6 @@ pub mod server_logic {
                     }
                 }
             }
-        }
         tokens
     }
 
@@ -543,14 +587,12 @@ pub mod client_logic {
                     let b64 = value[6..].trim();
                     if let Ok(decoded) =
                         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
-                    {
-                        if let Ok(ds) = String::from_utf8(decoded) {
+                        && let Ok(ds) = String::from_utf8(decoded) {
                             let parts: Vec<&str> = ds.splitn(2, ':').collect();
                             if parts.len() == 2 && parts[0] == user && parts[1] == pass {
                                 return true;
                             }
                         }
-                    }
                 }
                 break;
             }
@@ -766,7 +808,7 @@ pub mod client_logic {
         #[test]
         fn test_socks_udp_roundtrip_ipv6() {
             let reply = socks_udp_build_reply("::1", 443, b"v6");
-            let (host, port, data) = socks_udp_parse_request(&reply).unwrap();
+            let (_host, port, data) = socks_udp_parse_request(&reply).unwrap();
             assert_eq!(port, 443);
             assert_eq!(data, b"v6");
         }
@@ -939,7 +981,7 @@ pub mod client_logic {
 
         #[test]
         fn test_socks_udp_parse_short_port() {
-            let mut pkt = vec![0x00, 0x00, 0x00, 0x01, 10, 0, 0, 1]; // IPv4 but no port
+            let pkt = vec![0x00, 0x00, 0x00, 0x01, 10, 0, 0, 1]; // IPv4 but no port
             assert!(socks_udp_parse_request(&pkt).is_err());
         }
 

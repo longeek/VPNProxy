@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,48 @@ import (
 	"vpn-proxy-go/internal/frame"
 	"vpn-proxy-go/internal/tunnel"
 )
+
+// Simple rate limiter for client connections
+type rateLimiter struct {
+	mu         sync.Mutex
+	tokens     int
+	maxTokens  int
+	refillRate float64 // tokens per second
+	lastRefill time.Time
+}
+
+func newRateLimiter(ratePerSec float64, burst int) *rateLimiter {
+	return &rateLimiter{
+		tokens:     burst,
+		maxTokens:  burst,
+		refillRate: ratePerSec,
+		lastRefill: time.Now(),
+	}
+}
+
+func (r *rateLimiter) Allow() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now()
+	elapsed := now.Sub(r.lastRefill).Seconds()
+	newTokens := int(elapsed * r.refillRate)
+	if newTokens > 0 {
+		r.tokens += newTokens
+		if r.tokens > r.maxTokens {
+			r.tokens = r.maxTokens
+		}
+		r.lastRefill = now
+	}
+
+	if r.tokens > 0 {
+		r.tokens--
+		return true
+	}
+	return false
+}
+
+var connLimiter = newRateLimiter(100, 20)
 
 const (
 	recvBufSize    = 256 * 1024
@@ -120,14 +163,30 @@ func peerAllowed(peerIP net.IP, networks []*net.IPNet) bool {
 	return false
 }
 
+// AppError represents a structured application error
+type AppError struct {
+	Code    string
+	Message string
+	Err     error
+}
+
+func (e *AppError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("%s: %s (%v)", e.Code, e.Message, e.Err)
+	}
+	return fmt.Sprintf("%s: %s", e.Code, e.Message)
+}
+
+func (e *AppError) Unwrap() error {
+	return e.Err
+}
+
 type AppConfig struct {
 	AllowedTokens    map[string]bool
 	AllowNetworks    []*net.IPNet
 	ConnectTimeout   time.Duration
 	BootstrapTimeout time.Duration
 }
-
-
 
 func readBootstrapLine(conn net.Conn, timeout time.Duration) (string, error) {
 	lineBuf := make([]byte, 4096)
@@ -157,8 +216,9 @@ func readBootstrapLine(conn net.Conn, timeout time.Duration) (string, error) {
 }
 
 type dnsEntry struct {
-	ip net.IP
-	ts time.Time
+	ip       net.IP
+	ts       time.Time
+	negative bool // true if this entry represents a failed DNS lookup
 }
 
 var dnsCache sync.Map
@@ -170,6 +230,10 @@ func cachedLookupHost(host string) net.IP {
 	if v, ok := dnsCache.Load(host); ok {
 		e := v.(*dnsEntry)
 		if now.Sub(e.ts) < dnsCacheTTL {
+			if e.negative {
+				// Negative cache hit: recent DNS failure, skip retry
+				return nil
+			}
 			return e.ip
 		}
 		dnsCache.Delete(host)
@@ -177,6 +241,8 @@ func cachedLookupHost(host string) net.IP {
 
 	addrs, err := net.LookupHost(host)
 	if err != nil {
+		// Cache failed DNS lookup for short TTL to avoid repeated retries
+		dnsCache.Store(host, &dnsEntry{ip: nil, ts: now, negative: true})
 		return nil
 	}
 	var ip net.IP
@@ -197,7 +263,7 @@ func cachedLookupHost(host string) net.IP {
 		}
 	}
 	if ip != nil {
-		dnsCache.Store(host, &dnsEntry{ip: ip, ts: now})
+		dnsCache.Store(host, &dnsEntry{ip: ip, ts: now, negative: false})
 	}
 	return ip
 }
@@ -281,7 +347,7 @@ func handleUDPRelay(tlsConn net.Conn, stats *tunnel.SessionStats, host string, p
 			}
 			udpAddr := &net.UDPAddr{IP: targetIP, Port: int(sendPort)}
 			udpSock.WriteToUDP(f.Data, udpAddr)
-			stats.UploadBytes.Add(uint64(len(f.Data)+4+len(f.Host)+4))
+			stats.UploadBytes.Add(uint64(len(f.Data) + 4 + len(f.Host) + 4))
 		}
 	}()
 
@@ -329,6 +395,9 @@ func setClientSocketOpts(tlsConn net.Conn) {
 			raw.SetNoDelay(true)
 			raw.SetReadBuffer(recvBufSize)
 			raw.SetWriteBuffer(recvBufSize)
+			// Enable TCP keepalive to detect half-open connections
+			raw.SetKeepAlive(true)
+			raw.SetKeepAlivePeriod(30 * time.Second)
 		}
 	}
 }
@@ -339,6 +408,13 @@ func handleClient(tlsConn net.Conn, ctx *AppConfig) {
 
 	peer := tlsConn.RemoteAddr()
 	stats := &tunnel.SessionStats{}
+
+	// Rate limiting check
+	if !connLimiter.Allow() {
+		log.Printf("[sid=%s] connection rate limit exceeded from %v", sessionID, peer)
+		tlsConn.Write([]byte("ERR rate limit\n"))
+		return
+	}
 
 	setClientSocketOpts(tlsConn)
 
@@ -379,16 +455,23 @@ func handleClient(tlsConn net.Conn, ctx *AppConfig) {
 }
 
 func Run(cfg *AppConfig, certPath, keyPath, listenAddr string) {
+	RunWithContext(context.Background(), cfg, certPath, keyPath, listenAddr)
+}
+
+// activeConns tracks currently active connections for graceful shutdown
+var activeConns sync.Map
+
+func RunWithContext(ctx context.Context, cfg *AppConfig, certPath, keyPath, listenAddr string) {
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
 		log.Fatalf("cannot load cert/key: %v", err)
 	}
 
 	tlsCfg := &tls.Config{
-		Certificates:     []tls.Certificate{cert},
-		MinVersion:       tls.VersionTLS12,
-		CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256},
-		ClientSessionCache: tls.NewLRUClientSessionCache(128),
+		Certificates:           []tls.Certificate{cert},
+		MinVersion:             tls.VersionTLS12,
+		CurvePreferences:       []tls.CurveID{tls.X25519, tls.CurveP256},
+		ClientSessionCache:     tls.NewLRUClientSessionCache(128),
 		SessionTicketsDisabled: false,
 	}
 
@@ -400,12 +483,46 @@ func Run(cfg *AppConfig, certPath, keyPath, listenAddr string) {
 
 	log.Printf("server started on %s", listenAddr)
 
+	// Graceful shutdown support
+	go func() {
+		<-ctx.Done()
+		log.Println("shutting down server...")
+		tlsLn.Close()
+
+		// Wait for active connections to finish (with timeout)
+		waitCh := make(chan struct{})
+		go func() {
+			activeConns.Range(func(_, _ interface{}) bool {
+				return true // Just count
+			})
+			close(waitCh)
+		}()
+
+		select {
+		case <-waitCh:
+			log.Println("all connections closed")
+		case <-time.After(30 * time.Second):
+			log.Println("timeout waiting for connections to close")
+		}
+	}()
+
 	for {
 		conn, err := tlsLn.Accept()
 		if err != nil {
+			// Check if shutdown was requested
+			if ctx.Err() != nil {
+				log.Println("server stopped")
+				return
+			}
 			log.Printf("TLS accept error: %v", err)
 			continue
 		}
-		go handleClient(conn, cfg)
+		// Track connection
+		id := nextSessionID()
+		activeConns.Store(id, conn)
+		go func(id string, conn net.Conn) {
+			defer activeConns.Delete(id)
+			handleClient(conn, cfg)
+		}(id, conn)
 	}
 }

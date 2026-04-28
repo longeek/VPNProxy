@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"vpn-proxy-go/internal/server"
@@ -42,5 +45,17 @@ func main() {
 	}
 
 	listenAddr := fmt.Sprintf("%s:%d", *listen, *port)
-	server.Run(cfg, *cert, *key, listenAddr)
+
+	// Setup signal handling for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigCh
+		log.Println("shutting down...")
+		cancel()
+	}()
+
+	server.RunWithContext(ctx, cfg, *cert, *key, listenAddr)
 }

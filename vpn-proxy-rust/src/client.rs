@@ -226,15 +226,12 @@ impl TunnelPool {
                 continue;
             }
             let mut status_buf = vec![0u8; 64];
-            match tokio::time::timeout(Duration::from_secs(10), tls.read(&mut status_buf)).await {
-                Ok(Ok(n)) => {
-                    let status = String::from_utf8_lossy(&status_buf[..n]);
-                    if status.starts_with("OK") {
-                        self.hits += 1;
-                        return Some(tls);
-                    }
+            if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(10), tls.read(&mut status_buf)).await {
+                let status = String::from_utf8_lossy(&status_buf[..n]);
+                if status.starts_with("OK") {
+                    self.hits += 1;
+                    return Some(tls);
                 }
-                _ => {}
             }
             let _ = tls.shutdown().await;
         }
@@ -256,12 +253,11 @@ impl PooledTunnelOpener {
     ) -> std::io::Result<TlsStream> {
         {
             let mut pool_guard = self.pool.lock().await;
-            if let Some(ref mut pool) = *pool_guard {
-                if let Some(tls) = pool.acquire(target_host, target_port, proto).await {
+            if let Some(ref mut pool) = *pool_guard
+                && let Some(tls) = pool.acquire(target_host, target_port, proto).await {
                     info!("[pool] reused warm TLS connection");
                     return Ok(tls);
                 }
-            }
         }
         open_tunnel(
             &cli.server, cli.server_port, &cli.token, cli.tls_config.clone(),
@@ -468,9 +464,7 @@ async fn handle_socks_udp_relay(
                 Ok(f) => f,
                 Err(_) => break,
             };
-            let pkt = match socks_udp_build_reply(&frame.host, frame.port, &frame.data) {
-                p => p,
-            };
+            let pkt = socks_udp_build_reply(&frame.host, frame.port, &frame.data);
             let key = (frame.host.clone(), frame.port);
             let client_addr = {
                 let mut p = pending1.lock().await;
