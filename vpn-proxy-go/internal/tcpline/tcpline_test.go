@@ -15,7 +15,7 @@ func TestContainsNewline(t *testing.T) {
 		{"has CRLF", []byte("hello\r\n"), true},
 		{"empty", []byte(""), false},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := containsNewline(tt.buf)
@@ -38,7 +38,7 @@ func TestFindNewline(t *testing.T) {
 		{"CRLF", []byte("hello\r\nworld"), 6},
 		{"empty", []byte(""), -1},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := findNewline(tt.buf)

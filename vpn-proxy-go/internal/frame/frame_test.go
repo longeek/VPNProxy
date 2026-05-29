@@ -2,8 +2,8 @@ package frame
 
 import (
 	"bytes"
-	"encoding/binary"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"testing"
 )
@@ -13,7 +13,7 @@ func TestReadFromStream(t *testing.T) {
 	host := "example.com"
 	data := []byte("hello")
 	frame := Pack(host, 443, data)
-	
+
 	// Create a reader from the frame
 	r := bytes.NewReader(frame)
 	result, err := ReadFromStream(r)
@@ -36,7 +36,7 @@ func TestReadFromStreamPooled(t *testing.T) {
 	host := "test.com"
 	data := []byte("pooled test")
 	frame := Pack(host, 53, data)
-	
+
 	r := bytes.NewReader(frame)
 	result, err := ReadFromStreamPooled(r)
 	if err != nil {
@@ -51,7 +51,7 @@ func TestPack(t *testing.T) {
 	host := "192.168.1.1"
 	data := []byte("test data")
 	frame := Pack(host, 8080, data)
-	
+
 	if len(frame) == 0 {
 		t.Error("Pack returned empty frame")
 	}
@@ -64,7 +64,7 @@ func TestPack(t *testing.T) {
 func TestPackTo(t *testing.T) {
 	host := "10.0.0.1"
 	data := []byte("pack to test")
-	
+
 	var buf bytes.Buffer
 	n, err := PackTo(&buf, host, 1234, data)
 	if err != nil {
@@ -79,7 +79,7 @@ func TestReadFromSlice(t *testing.T) {
 	host := "example.org"
 	data := []byte("slice test")
 	frame := Pack(host, 443, data)
-	
+
 	result, wireLen, err := ReadFromSlice(frame)
 	if err != nil {
 		t.Fatalf("ReadFromSlice failed: %v", err)
@@ -102,11 +102,11 @@ func TestReadFromSliceTooShort(t *testing.T) {
 
 func TestSocksUdpParseRequest(t *testing.T) {
 	// Build a SOCKS UDP packet with IPv4
-	packet := []byte{0x00, 0x00, 0x00, 0x01} // RSV, FRAG, ATYP=IPv4
+	packet := []byte{0x00, 0x00, 0x00, 0x01}        // RSV, FRAG, ATYP=IPv4
 	packet = append(packet, []byte{10, 0, 0, 1}...) // IP 10.0.0.1
-	packet = append(packet, []byte{0x00, 0x35}...) // port 53
+	packet = append(packet, []byte{0x00, 0x35}...)  // port 53
 	packet = append(packet, []byte("dns data")...)
-	
+
 	host, port, payload, err := SocksUdpParseRequest(packet)
 	if err != nil {
 		t.Fatalf("SocksUdpParseRequest failed: %v", err)
@@ -159,12 +159,12 @@ func TestCheckHTTPBasicAuth(t *testing.T) {
 	// Valid auth
 	creds := base64.StdEncoding.EncodeToString([]byte("user:pass"))
 	header := []byte("Proxy-Authorization: Basic " + creds + "\r\n\r\n")
-	
+
 	result := CheckHTTPBasicAuth(header, "user", "pass")
 	if !result {
 		t.Error("CheckHTTPBasicAuth should return true for valid credentials")
 	}
-	
+
 	// Invalid auth
 	result = CheckHTTPBasicAuth(header, "user", "wrong")
 	if result {
@@ -190,13 +190,13 @@ func TestWriteToStream(t *testing.T) {
 	host := "example.com"
 	port := uint16(443)
 	data := []byte("test data")
-	
+
 	var buf bytes.Buffer
 	err := WriteToStream(&buf, host, port, data)
 	if err != nil {
 		t.Fatalf("WriteToStream failed: %v", err)
 	}
-	
+
 	// Verify we can read it back
 	result, err := ReadFromStream(&buf)
 	if err != nil {
@@ -256,7 +256,7 @@ func TestReadFromSlicePayloadTooLong(t *testing.T) {
 	copy(buf[4:], hb)
 	off := 4 + len(hb)
 	binary.BigEndian.PutUint16(buf[off+2:off+4], uint16(len(data)))
-	
+
 	result, wireLen, err := ReadFromSlice(buf)
 	if err != nil {
 		t.Fatalf("ReadFromSlice failed: %v", err)
@@ -273,7 +273,7 @@ func TestPackEmptyData(t *testing.T) {
 	host := "example.com"
 	port := uint16(443)
 	data := []byte{}
-	
+
 	frame := Pack(host, port, data)
 	if len(frame) == 0 {
 		t.Error("Pack returned empty frame")
@@ -299,6 +299,7 @@ func TestPackEmptyData(t *testing.T) {
 
 // badReader always returns an error
 type badReader struct{}
+
 func (b *badReader) Read(p []byte) (n int, err error) {
 	return 0, fmt.Errorf("read error")
 }
@@ -311,9 +312,10 @@ func TestReadFromStreamError(t *testing.T) {
 }
 
 type shortReader struct {
-	data []byte
+	data      []byte
 	readCount int
 }
+
 func (s *shortReader) Read(p []byte) (n int, err error) {
 	if s.readCount > 0 {
 		return 0, fmt.Errorf("short read")
@@ -341,12 +343,12 @@ func TestReadFromStreamPooledError(t *testing.T) {
 
 func TestSocksUdpParseRequest_IPv6(t *testing.T) {
 	// Build a SOCKS UDP packet with IPv6
-	packet := []byte{0x00, 0x00, 0x00, 0x04} // RSV, FRAG, ATYP=IPv6
+	packet := []byte{0x00, 0x00, 0x00, 0x04}                                                                       // RSV, FRAG, ATYP=IPv6
 	ipv6 := []byte{0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01} // ::1
 	packet = append(packet, ipv6...)
 	packet = append(packet, 0x00, 0x35) // port 53
 	packet = append(packet, []byte("dns data")...)
-	
+
 	host, port, payload, err := SocksUdpParseRequest(packet)
 	if err != nil {
 		t.Fatalf("SocksUdpParseRequest failed: %v", err)
@@ -364,11 +366,11 @@ func TestSocksUdpParseRequest_Domain(t *testing.T) {
 	// Build a SOCKS UDP packet with domain
 	// This test expects domain format; actual parsing depends on implementation
 	// For now, test IPv4 which we know works
-	packet := []byte{0x00, 0x00, 0x00, 0x01} // RSV, FRAG, ATYP=IPv4
+	packet := []byte{0x00, 0x00, 0x00, 0x01}        // RSV, FRAG, ATYP=IPv4
 	packet = append(packet, []byte{10, 0, 0, 1}...) // IP 10.0.0.1
-	packet = append(packet, 0x00, 0x35) // port 53
+	packet = append(packet, 0x00, 0x35)             // port 53
 	packet = append(packet, []byte("dns data")...)
-	
+
 	_, port, payload, err := SocksUdpParseRequest(packet)
 	if err != nil {
 		t.Fatalf("SocksUdpParseRequest failed: %v", err)
@@ -495,6 +497,7 @@ func TestParseTCPLineTarget_PortZero(t *testing.T) {
 
 // badWriter always returns an error
 type badWriter struct{}
+
 func (b *badWriter) Write(p []byte) (n int, err error) {
 	return 0, fmt.Errorf("write error")
 }

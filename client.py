@@ -394,7 +394,7 @@ def socks_udp_parse_request(packet: bytes) -> tuple[str, int, bytes]:
     if atyp == 0x01:
         if len(packet) < off + 6:
             raise ValueError("short ipv4")
-        host = socket.inet_ntop(socket.AF_INET, packet[off : off + 4])
+        host = socket.inet_ntop(socket.AF_INET, packet[off:off + 4])
         off += 4
     elif atyp == 0x03:
         if off >= len(packet):
@@ -403,16 +403,16 @@ def socks_udp_parse_request(packet: bytes) -> tuple[str, int, bytes]:
         off += 1
         if len(packet) < off + ln + 2:
             raise ValueError("short domain body")
-        host = packet[off : off + ln].decode("utf-8", errors="replace")
+        host = packet[off:off + ln].decode("utf-8", errors="replace")
         off += ln
     elif atyp == 0x04:
         if len(packet) < off + 18:
             raise ValueError("short ipv6")
-        host = socket.inet_ntop(socket.AF_INET6, packet[off : off + 16])
+        host = socket.inet_ntop(socket.AF_INET6, packet[off:off + 16])
         off += 16
     else:
         raise ValueError("unsupported socks udp atyp")
-    port = int.from_bytes(packet[off : off + 2], "big")
+    port = int.from_bytes(packet[off:off + 2], "big")
     off += 2
     return host, port, packet[off:]
 

@@ -3,7 +3,7 @@ package pool
 import (
 	"testing"
 	"time"
-	
+
 	"vpn-proxy-go/internal/tunnel"
 )
 
@@ -13,7 +13,7 @@ func TestNew(t *testing.T) {
 		ServerPort: 443,
 		Token:      "test-token",
 	}
-	
+
 	p := New(cfg, 5, 30*time.Second)
 	if p == nil {
 		t.Error("New should return non-nil Pool")
@@ -32,7 +32,7 @@ func TestPool_Stop(t *testing.T) {
 		ServerPort: 443,
 		Token:      "test-token",
 	}
-	
+
 	p := New(cfg, 5, 30*time.Second)
 	// Stop should not panic even if not started
 	p.Stop()
@@ -40,4 +40,3 @@ func TestPool_Stop(t *testing.T) {
 
 // Note: Testing Acquire and bootstrap requires network connection
 // In production, these would use dependency injection or mocking
-

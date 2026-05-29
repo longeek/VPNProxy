@@ -39,6 +39,12 @@ thread_local! {
 /// ```
 pub struct BufPool;
 
+impl Default for BufPool {
+    fn default() -> Self {
+        Self
+    }
+}
+
 impl BufPool {
     /// Creates a new `BufPool`.
     ///

@@ -17,7 +17,7 @@ func TestContainsMethod(t *testing.T) {
 		{"single method match", []byte{0x00}, 0x00, true},
 		{"single method no match", []byte{0x01}, 0x00, false},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := containsMethod(tt.methods, tt.method)

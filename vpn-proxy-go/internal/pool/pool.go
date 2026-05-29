@@ -38,9 +38,9 @@ type Pool struct {
 	mu      sync.Mutex
 	entries []entry
 	cfg     *tunnel.Config
-	maxSize int          // maximum number of warm connections to maintain
+	maxSize int           // maximum number of warm connections to maintain
 	ttl     time.Duration // max age of a pooled connection before eviction
-	hits    uint64       // total pool hits (for diagnostics)
+	hits    uint64        // total pool hits (for diagnostics)
 	closed  bool
 }
 

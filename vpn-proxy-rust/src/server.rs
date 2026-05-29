@@ -478,14 +478,15 @@ async fn handle_client(tls_stream: TlsStream, ctx: Arc<AppContext>) {
         return;
     }
 
-    if let Some(ref peer_addr) = peer {
-        if !peer_allowed(peer_addr.ip(), &ctx.allow_networks) {
-            warn!("[sid={session_id}] peer not in allow-cidrs: {peer_addr}");
-            let (_r, mut w) = tokio::io::split(tls_stream);
-            let _ = w.write_all(b"ERR connect\n").await;
-            let _ = w.flush().await;
-            return;
-        }
+    // Reject peers outside the allowed CIDR whitelist (if configured)
+    if let Some(ref peer_addr) = peer
+        && !peer_allowed(peer_addr.ip(), &ctx.allow_networks)
+    {
+        warn!("[sid={session_id}] peer not in allow-cidrs: {peer_addr}");
+        let (_r, mut w) = tokio::io::split(tls_stream);
+        let _ = w.write_all(b"ERR connect\n").await;
+        let _ = w.flush().await;
+        return;
     }
 
     let mut tls = tls_stream;

@@ -941,9 +941,12 @@ async def main():
     go_tun_str = f"{go_tunnel:.1f}ms" if go_tunnel else "N/A"
     rust_tun_str = f"{rust_tunnel:.1f}ms" if rust_tunnel else "N/A"
     candidates = {}
-    if py_tunnel: candidates["Python"] = py_tunnel
-    if go_tunnel: candidates["Go"] = go_tunnel
-    if rust_tunnel: candidates["Rust"] = rust_tunnel
+    if py_tunnel:
+        candidates["Python"] = py_tunnel
+    if go_tunnel:
+        candidates["Go"] = go_tunnel
+    if rust_tunnel:
+        candidates["Rust"] = rust_tunnel
     winner = min(candidates, key=candidates.get) if candidates else "—"
     print_row(["Tunnel Setup (mean)", py_tun_str, go_tun_str, rust_tun_str, winner])
 

@@ -98,12 +98,12 @@ func ReadFromStreamPooled(r io.Reader) (*UdpFrame, error) {
 	if _, err := io.ReadFull(r, buf[4:4+nlen]); err != nil {
 		return nil, err
 	}
-	host := string(buf[4:4+nlen])
+	host := string(buf[4 : 4+nlen])
 	if _, err := io.ReadFull(r, buf[4+nlen:4+nlen+4]); err != nil {
 		return nil, err
 	}
-	port := binary.BigEndian.Uint16(buf[4+nlen:4+nlen+2])
-	dlen := int(binary.BigEndian.Uint16(buf[4+nlen+2:4+nlen+4]))
+	port := binary.BigEndian.Uint16(buf[4+nlen : 4+nlen+2])
+	dlen := int(binary.BigEndian.Uint16(buf[4+nlen+2 : 4+nlen+4]))
 	if dlen > 65535 {
 		return nil, ErrBadPayloadLen
 	}
@@ -130,7 +130,7 @@ func SocksUdpParseRequest(packet []byte) (host string, port uint16, payload []by
 		if len(packet) < off+4+2 {
 			return "", 0, nil, errors.New("short ipv4")
 		}
-		host = net.IP(packet[off:off+4]).To4().String()
+		host = net.IP(packet[off : off+4]).To4().String()
 		off += 4
 	case 0x03:
 		ln := int(packet[off])
@@ -138,13 +138,13 @@ func SocksUdpParseRequest(packet []byte) (host string, port uint16, payload []by
 		if len(packet) < off+ln+2 {
 			return "", 0, nil, errors.New("short domain")
 		}
-		host = string(packet[off:off+ln])
+		host = string(packet[off : off+ln])
 		off += ln
 	case 0x04:
 		if len(packet) < off+16+2 {
 			return "", 0, nil, errors.New("short ipv6")
 		}
-		host = net.IP(packet[off:off+16]).To16().String()
+		host = net.IP(packet[off : off+16]).To16().String()
 		off += 16
 	default:
 		return "", 0, nil, errors.New("unsupported atyp")
@@ -152,7 +152,7 @@ func SocksUdpParseRequest(packet []byte) (host string, port uint16, payload []by
 	if len(packet) < off+2 {
 		return "", 0, nil, errors.New("short port")
 	}
-	port = binary.BigEndian.Uint16(packet[off:off+2])
+	port = binary.BigEndian.Uint16(packet[off : off+2])
 	payload = packet[off+2:]
 	return host, port, payload, nil
 }
@@ -162,7 +162,10 @@ func SocksUdpBuildReply(host string, port uint16, data []byte) []byte {
 	if ip != nil {
 		if v4 := ip.To4(); v4 != nil {
 			buf := make([]byte, 4+4+2+len(data))
-			buf[0] = 0x00; buf[1] = 0x00; buf[2] = 0x00; buf[3] = 0x01
+			buf[0] = 0x00
+			buf[1] = 0x00
+			buf[2] = 0x00
+			buf[3] = 0x01
 			copy(buf[4:8], v4)
 			binary.BigEndian.PutUint16(buf[8:10], port)
 			copy(buf[10:], data)
@@ -170,7 +173,10 @@ func SocksUdpBuildReply(host string, port uint16, data []byte) []byte {
 		}
 		if v6 := ip.To16(); v6 != nil {
 			buf := make([]byte, 4+16+2+len(data))
-			buf[0] = 0x00; buf[1] = 0x00; buf[2] = 0x00; buf[3] = 0x04
+			buf[0] = 0x00
+			buf[1] = 0x00
+			buf[2] = 0x00
+			buf[3] = 0x04
 			copy(buf[4:20], v6)
 			binary.BigEndian.PutUint16(buf[20:22], port)
 			copy(buf[22:], data)
@@ -179,7 +185,10 @@ func SocksUdpBuildReply(host string, port uint16, data []byte) []byte {
 	}
 	hb := []byte(host)
 	buf := make([]byte, 4+1+len(hb)+2+len(data))
-	buf[0] = 0x00; buf[1] = 0x00; buf[2] = 0x00; buf[3] = 0x03
+	buf[0] = 0x00
+	buf[1] = 0x00
+	buf[2] = 0x00
+	buf[3] = 0x03
 	buf[4] = byte(len(hb))
 	copy(buf[5:5+len(hb)], hb)
 	binary.BigEndian.PutUint16(buf[5+len(hb):5+len(hb)+2], port)

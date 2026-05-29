@@ -56,7 +56,7 @@ func TestResolveHost_Empty(t *testing.T) {
 	// This requires valid DNS, so we test the error path
 	// by calling resolveHost with an invalid host that will fail DNS
 	// which requires network connection
-	
+
 	// Alternative: test that the function exists and can be called
 	// We can't easily test DNS in unit tests without mocking
 	_ = resolveHost
@@ -78,7 +78,7 @@ func TestLoadAllowedTokens_WithComments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
-	
+
 	tokens := LoadAllowedTokens("", tmpFile)
 	if len(tokens) != 3 {
 		t.Errorf("Expected 3 tokens, got %d", len(tokens))
@@ -191,7 +191,7 @@ func TestAppError(t *testing.T) {
 	if msg == "" {
 		t.Error("Error message should not be empty")
 	}
-	
+
 	// Test with wrapped error
 	wrappedErr := &AppError{
 		Code:    "ERR_CONNECT",
@@ -208,7 +208,7 @@ func TestAppError(t *testing.T) {
 func TestParseBootstrapLine_Valid(t *testing.T) {
 	line := `{"auth":"test-token","host":"example.com","port":443,"proto":"tcp"}`
 	tokens := map[string]bool{"test-token": true}
-	
+
 	host, port, proto, err := parseBootstrapLine(line, tokens)
 	if err != nil {
 		t.Fatalf("parseBootstrapLine failed: %v", err)
@@ -227,7 +227,7 @@ func TestParseBootstrapLine_Valid(t *testing.T) {
 func TestParseBootstrapLine_InvalidJSON(t *testing.T) {
 	line := `invalid json`
 	tokens := map[string]bool{"test-token": true}
-	
+
 	_, _, _, err := parseBootstrapLine(line, tokens)
 	if err == nil {
 		t.Error("Expected error for invalid JSON")
@@ -237,7 +237,7 @@ func TestParseBootstrapLine_InvalidJSON(t *testing.T) {
 func TestParseBootstrapLine_InvalidAuth(t *testing.T) {
 	line := `{"auth":"wrong-token","host":"example.com","port":443}`
 	tokens := map[string]bool{"test-token": true}
-	
+
 	_, _, _, err := parseBootstrapLine(line, tokens)
 	if err == nil {
 		t.Error("Expected error for invalid auth")
@@ -247,7 +247,7 @@ func TestParseBootstrapLine_InvalidAuth(t *testing.T) {
 func TestParseBootstrapLine_MissingHost(t *testing.T) {
 	line := `{"auth":"test-token"}`
 	tokens := map[string]bool{"test-token": true}
-	
+
 	_, _, _, err := parseBootstrapLine(line, tokens)
 	if err == nil {
 		t.Error("Expected error for missing host")
@@ -257,7 +257,7 @@ func TestParseBootstrapLine_MissingHost(t *testing.T) {
 func TestParseBootstrapLine_InvalidPort(t *testing.T) {
 	line := `{"auth":"test-token","host":"example.com","port":99999}`
 	tokens := map[string]bool{"test-token": true}
-	
+
 	_, _, _, err := parseBootstrapLine(line, tokens)
 	if err == nil {
 		t.Error("Expected error for invalid port")
@@ -267,7 +267,7 @@ func TestParseBootstrapLine_InvalidPort(t *testing.T) {
 func TestParseBootstrapLine_InvalidProto(t *testing.T) {
 	line := `{"auth":"test-token","host":"example.com","port":53,"proto":"invalid"}`
 	tokens := map[string]bool{"test-token": true}
-	
+
 	_, _, _, err := parseBootstrapLine(line, tokens)
 	if err == nil {
 		t.Error("Expected error for invalid proto")
@@ -277,7 +277,7 @@ func TestParseBootstrapLine_InvalidProto(t *testing.T) {
 func TestParseBootstrapLine_TCPPortZero(t *testing.T) {
 	line := `{"auth":"test-token","host":"example.com","port":0,"proto":"tcp"}`
 	tokens := map[string]bool{"test-token": true}
-	
+
 	_, _, _, err := parseBootstrapLine(line, tokens)
 	if err == nil {
 		t.Error("Expected error for tcp with port 0")
@@ -288,7 +288,7 @@ func TestParseBootstrapLine_DefaultProto(t *testing.T) {
 	// No proto specified, should default to tcp
 	line := `{"auth":"test-token","host":"example.com","port":443}`
 	tokens := map[string]bool{"test-token": true}
-	
+
 	_, _, proto, err := parseBootstrapLine(line, tokens)
 	if err != nil {
 		t.Fatalf("parseBootstrapLine failed: %v", err)
@@ -301,7 +301,7 @@ func TestParseBootstrapLine_DefaultProto(t *testing.T) {
 func TestParseBootstrapLine_UDP(t *testing.T) {
 	line := `{"auth":"test-token","host":"example.com","port":53,"proto":"udp"}`
 	tokens := map[string]bool{"test-token": true}
-	
+
 	_, port, proto, err := parseBootstrapLine(line, tokens)
 	if err != nil {
 		t.Fatalf("parseBootstrapLine failed: %v", err)

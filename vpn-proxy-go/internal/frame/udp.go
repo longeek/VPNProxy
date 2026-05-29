@@ -75,10 +75,10 @@ func ReadFromSlice(buf []byte) (*UdpFrame, int, error) {
 	if len(buf) < 4+nlen+4 {
 		return nil, 0, ErrBufferTooShort
 	}
-	host := string(buf[4:4+nlen])
+	host := string(buf[4 : 4+nlen])
 	off := 4 + nlen
-	port := binary.BigEndian.Uint16(buf[off:off+2])
-	dlen := int(binary.BigEndian.Uint16(buf[off+2:off+4]))
+	port := binary.BigEndian.Uint16(buf[off : off+2])
+	dlen := int(binary.BigEndian.Uint16(buf[off+2 : off+4]))
 	if dlen > 65535 {
 		return nil, 0, ErrBadPayloadLen
 	}
