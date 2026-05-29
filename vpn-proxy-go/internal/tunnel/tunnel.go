@@ -246,6 +246,11 @@ func RelayTCPServer(tlsConn, target net.Conn, stats *SessionStats) {
 	done := make(chan struct{}, 2)
 
 	// Upload: tlsConn → target (client data → backend server)
+	//
+	// Flush after every write to ensure small payloads (e.g. TLS ClientHello
+	// at ~460 bytes) are sent immediately instead of being stuck in the
+	// 128KB bufio buffer. Without this, the target never receives the
+	// request and no data flows back.
 	go func() {
 		defer putRelayBuf(bufUp)
 		bw := GetBufWriter(target)
@@ -259,51 +264,49 @@ func RelayTCPServer(tlsConn, target net.Conn, stats *SessionStats) {
 				}
 				pending += n
 				stats.UploadBytes.Add(uint64(n))
+				if bw.Flush() != nil {
+					break
+				}
+				// DrainThreshold is deliberately retained so that, for
+				// bulk transfers, we still batch flushes at a higher
+				// watermark; the per-write flush above guarantees
+				// interactivity for small payloads.
 				if pending >= DrainThreshold {
-					if bw.Flush() != nil {
-						break
-					}
 					pending = 0
 				}
 			}
 			if err != nil {
 				break
 			}
-		}
-		if pending > 0 {
-			bw.Flush()
 		}
 		target.Close()
 		done <- struct{}{}
 	}()
 
 	// Download: target → tlsConn (backend response → client)
+	//
+	// Per-write flush strategy (same as upload). On high-latency links
+	// (220ms RTT to China) the bottleneck is the TCP congestion window
+	// on the international link, not the flush overhead. Per-write flush
+	// ensures the lowest possible TTFB for interactive responses.
 	go func() {
 		defer putRelayBuf(bufDown)
 		bw := GetBufWriter(tlsConn)
 		defer PutBufWriter(bw)
-		pending := 0
 		for {
 			n, err := target.Read(bufDown)
 			if n > 0 {
 				if _, werr := bw.Write(bufDown[:n]); werr != nil {
 					break
 				}
-				pending += n
 				stats.DownloadBytes.Add(uint64(n))
-				if pending >= DrainThreshold {
-					if bw.Flush() != nil {
-						break
-					}
-					pending = 0
+				if bw.Flush() != nil {
+					break
 				}
 			}
 			if err != nil {
 				break
 			}
-		}
-		if pending > 0 {
-			bw.Flush()
 		}
 		tlsConn.Close()
 		done <- struct{}{}
