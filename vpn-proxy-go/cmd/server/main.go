@@ -5,6 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
+	_ "net/http/pprof" // register pprof handlers on default mux
 	"os"
 	"os/signal"
 	"syscall"
@@ -23,6 +26,8 @@ func main() {
 	allowCIDRs := flag.String("allow-cidrs", "", "comma-separated client IP CIDRs")
 	connectTimeout := flag.Float64("connect-timeout", 8, "backend connect timeout seconds")
 	bootstrapTimeout := flag.Float64("bootstrap-timeout", 30, "bootstrap line read timeout seconds")
+	maxConns := flag.Int("max-conns", 0, "max concurrent connections (0 = unlimited)")
+	pprofAddr := flag.String("pprof-addr", "", "pprof HTTP listen address (e.g. localhost:6060, empty=disabled)")
 
 	flag.Parse()
 
@@ -42,6 +47,7 @@ func main() {
 		AllowNetworks:    allowNets,
 		ConnectTimeout:   time.Duration(*connectTimeout) * time.Second,
 		BootstrapTimeout: time.Duration(*bootstrapTimeout) * time.Second,
+		MaxConns:         *maxConns,
 	}
 
 	listenAddr := fmt.Sprintf("%s:%d", *listen, *port)
@@ -56,6 +62,25 @@ func main() {
 		log.Println("shutting down...")
 		cancel()
 	}()
+
+	// Start pprof HTTP server if address is provided
+	if *pprofAddr != "" {
+		pprofLn, err := net.Listen("tcp", *pprofAddr)
+		if err != nil {
+			log.Fatalf("pprof listen failed on %s: %v", *pprofAddr, err)
+		}
+		go func() {
+			log.Printf("pprof listening on %s", pprofLn.Addr())
+			if err := http.Serve(pprofLn, nil); err != nil {
+				log.Printf("pprof server stopped: %v", err)
+			}
+		}()
+		// Close pprof on shutdown
+		go func() {
+			<-ctx.Done()
+			pprofLn.Close()
+		}()
+	}
 
 	server.RunWithContext(ctx, cfg, *cert, *key, listenAddr)
 }

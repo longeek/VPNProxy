@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -16,6 +16,49 @@ use vpn_proxy::server_logic::{
 };
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Token-bucket rate limiter (transplanted from Go implementation).
+/// Default: 100 tokens/sec, burst of 20.
+struct RateLimiter {
+    tokens: f64,
+    max_tokens: f64,
+    refill_rate: f64,
+    last_refill: Instant,
+}
+
+impl RateLimiter {
+    fn new(rate_per_sec: f64, burst: f64) -> Self {
+        Self {
+            tokens: burst,
+            max_tokens: burst,
+            refill_rate: rate_per_sec,
+            last_refill: Instant::now(),
+        }
+    }
+
+    fn allow(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.max_tokens);
+            self.last_refill = now;
+        }
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+static CONN_LIMITER: LazyLock<Mutex<RateLimiter>> =
+    LazyLock::new(|| Mutex::new(RateLimiter::new(100.0, 20.0)));
+
+fn init_rate_limiter(rate_per_sec: f64, burst: u32) {
+    let mut limiter = CONN_LIMITER.lock().unwrap();
+    *limiter = RateLimiter::new(rate_per_sec, burst as f64);
+}
 
 #[derive(Parser)]
 #[command(name = "vpn-proxy-server", about = "TLS tunnel proxy server")]
@@ -42,6 +85,10 @@ struct Cli {
     backlog: u32,
     #[arg(long, default_value = "INFO")]
     log_level: String,
+    #[arg(long, default_value_t = 100.0)]
+    rate_limit: f64,
+    #[arg(long, default_value_t = 20)]
+    rate_burst: u32,
 }
 
 fn load_tokens_cli(cli: &Cli) -> Vec<String> {
@@ -383,6 +430,17 @@ async fn handle_client(tls_stream: TlsStream, ctx: Arc<AppContext>) {
     let peer = tls_stream.get_ref().0.peer_addr().ok();
     let stats = Arc::new(SessionStats::new());
 
+    // Rate limiting check (transplanted from Go implementation)
+    // NOTE: MutexGuard must be DROPPED before any .await to satisfy Send bound in tokio::spawn
+    let rate_allowed = CONN_LIMITER.lock().unwrap().allow();
+    if !rate_allowed {
+        warn!("[sid={session_id}] connection rate limit exceeded from {:?}", peer);
+        let (_r, mut w) = tokio::io::split(tls_stream);
+        let _ = w.write_all(b"ERR rate limit\n").await;
+        let _ = w.flush().await;
+        return;
+    }
+
     if let Some(ref peer_addr) = peer {
         if !peer_allowed(peer_addr.ip(), &ctx.allow_networks) {
             warn!("[sid={session_id}] peer not in allow-cidrs: {peer_addr}");
@@ -512,6 +570,10 @@ async fn main() {
     if !allow_networks.is_empty() {
         info!("allow-cidrs enabled with {} network(s)", allow_networks.len());
     }
+
+    // Initialize rate limiter from CLI args
+    init_rate_limiter(cli.rate_limit, cli.rate_burst);
+    info!("rate limit: {} req/s, burst={}", cli.rate_limit, cli.rate_burst);
 
     let ctx = Arc::new(AppContext {
         allowed_tokens,

@@ -65,9 +65,11 @@ func (p *Pool) Start(ctx context.Context) {
 }
 
 func (p *Pool) refillLoop(ctx context.Context) {
+	ticker := time.NewTicker(300 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		select {
-		case <-time.After(300 * time.Millisecond):
+		case <-ticker.C:
 		case <-ctx.Done():
 			return
 		}
@@ -90,13 +92,22 @@ func (p *Pool) refillLoop(ctx context.Context) {
 		need := p.maxSize - len(p.entries)
 		p.mu.Unlock()
 
-		if need > 0 {
+		if need <= 0 {
+			continue
+		}
+		// Batch-create all needed connections at once to avoid slow ramp-up
+		var fresh []entry
+		for i := 0; i < need; i++ {
 			conn, err := tunnel.Open(ctx, p.cfg, "0.0.0.0", 1, "tcp")
-			if err == nil {
-				p.mu.Lock()
-				p.entries = append(p.entries, entry{conn: conn, created: time.Now()})
-				p.mu.Unlock()
+			if err != nil {
+				break
 			}
+			fresh = append(fresh, entry{conn: conn, created: time.Now()})
+		}
+		if len(fresh) > 0 {
+			p.mu.Lock()
+			p.entries = append(p.entries, fresh...)
+			p.mu.Unlock()
 		}
 	}
 }
@@ -132,8 +143,9 @@ func (p *Pool) popEntry() *entry {
 	if len(p.entries) == 0 {
 		return nil
 	}
-	e := p.entries[len(p.entries)-1]
-	p.entries = p.entries[:len(p.entries)-1]
+	// FIFO: pop from front so connections age evenly
+	e := p.entries[0]
+	p.entries = p.entries[1:]
 	return &e
 }
 

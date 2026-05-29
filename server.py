@@ -21,6 +21,64 @@ class AuthError(Exception):
     pass
 
 
+class _DnsEntry:
+    __slots__ = ("ip", "expires")
+    def __init__(self, ip: Optional[str], expires: float) -> None:
+        self.ip = ip
+        self.expires = expires
+
+
+class DnsCache:
+    """DNS cache with TTL and negative caching (transplanted from Go impl).
+
+    - Positive entries cached for DNS_CACHE_TTL seconds (default 30s).
+    - Negative entries (failed lookups) cached to avoid repeated retries.
+    - Thread-safe via asyncio.Lock.
+    """
+
+    def __init__(self, ttl: float = 30.0) -> None:
+        self._ttl = ttl
+        self._cache: dict[str, _DnsEntry] = {}
+        self._lock = asyncio.Lock()
+
+    async def resolve(self, host: str) -> Optional[str]:
+        """Return cached IP or resolve and cache. Returns None on failure."""
+        now = time.monotonic()
+        async with self._lock:
+            entry = self._cache.get(host)
+            if entry is not None and now < entry.expires:
+                return entry.ip  # may be None (negative cache hit)
+
+        # Cache miss: perform DNS resolution
+        try:
+            addrs = await asyncio.get_running_loop().getaddrinfo(host, None)
+        except OSError:
+            # Negative cache: remember failure for short TTL
+            async with self._lock:
+                self._cache[host] = _DnsEntry(None, now + self._ttl * 0.3)
+            return None
+
+        # Prefer IPv4, fallback to any
+        ip: Optional[str] = None
+        for family, *_rest, sockaddr in addrs:
+            addr = sockaddr[0]
+            if family == socket.AF_INET:
+                ip = addr
+                break
+            if ip is None:
+                ip = addr
+        if ip is None:
+            return None
+
+        async with self._lock:
+            self._cache[host] = _DnsEntry(ip, now + self._ttl)
+        return ip
+
+
+# Global DNS cache instance (shared across all connections)
+_dns_cache = DnsCache()
+
+
 @dataclass
 class SessionStats:
     upload_bytes: int = 0
@@ -30,7 +88,7 @@ class SessionStats:
 _RECV_BUF = 256 * 1024
 
 
-def _set_socket_options(writer: asyncio.StreamWriter) -> None:
+def _set_socket_options(writer: asyncio.StreamWriter, enable_keepalive: bool = False) -> None:
     if not hasattr(writer, "get_extra_info"):
         return
     sock = writer.get_extra_info("socket")
@@ -48,6 +106,18 @@ def _set_socket_options(writer: asyncio.StreamWriter) -> None:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _RECV_BUF)
     except OSError:
         pass
+    if enable_keepalive:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            # Windows: set keepalive interval via ioctl (may not be available)
+            if hasattr(socket, "TCP_KEEPIDLE"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)  # type: ignore[attr-defined]
+            if hasattr(socket, "TCP_KEEPINTVL"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)  # type: ignore[attr-defined]
+            if hasattr(socket, "TCP_KEEPCNT"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)  # type: ignore[attr-defined]
+        except OSError:
+            pass
 
 
 def load_allowed_tokens(args: argparse.Namespace) -> set[str]:
@@ -292,7 +362,7 @@ async def handle_client(
     peer = writer.get_extra_info("peername")
     stats = SessionStats()
     target_writer: Optional[asyncio.StreamWriter] = None
-    _set_socket_options(writer)
+    _set_socket_options(writer, enable_keepalive=True)
     try:
         if not peer_allowed(peer, allow_networks):
             raise PermissionError("peer not in allow-cidrs")
@@ -315,19 +385,24 @@ async def handle_client(
             await run_udp_relay(reader, writer, stats, host, port)
         else:
             t0 = time.perf_counter()
+            # DNS cache lookup (transplanted from Go impl)
+            cached_ip = await _dns_cache.resolve(host)
+            if cached_ip is None:
+                raise OSError(f"DNS resolution failed for {host}")
             target_reader, target_writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port),
+                asyncio.open_connection(cached_ip, port),
                 timeout=connect_timeout,
             )
             _set_socket_options(target_writer)
             t1 = time.perf_counter()
             LOG.debug(
-                "[sid=%s] backend connect timing: %.0fms to %s:%s (timeout=%.1fs)",
+                "[sid=%s] backend connect timing: %.0fms to %s:%s (timeout=%.1fs), dns=%s",
                 session_id,
                 (t1 - t0) * 1000.0,
                 host,
                 port,
                 connect_timeout,
+                cached_ip,
             )
 
             writer.write(b"OK\n")

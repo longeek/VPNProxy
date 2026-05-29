@@ -186,6 +186,7 @@ type AppConfig struct {
 	AllowNetworks    []*net.IPNet
 	ConnectTimeout   time.Duration
 	BootstrapTimeout time.Duration
+	MaxConns         int // max concurrent connections (0 = unlimited)
 }
 
 func readBootstrapLine(conn net.Conn, timeout time.Duration) (string, error) {
@@ -326,7 +327,8 @@ func handleUDPRelay(tlsConn net.Conn, stats *tunnel.SessionStats, host string, p
 	tlsConn.Write([]byte("OK\n"))
 
 	var tunnelWriteMu sync.Mutex
-	bw := bufio.NewWriterSize(tlsConn, pipeBufSize)
+	bw := tunnel.GetBufWriter(tlsConn)
+	defer tunnel.PutBufWriter(bw)
 	pendingWrite := 0
 
 	go func() {
@@ -506,6 +508,14 @@ func RunWithContext(ctx context.Context, cfg *AppConfig, certPath, keyPath, list
 		}
 	}()
 
+	// Concurrency limiter: semaphore-based worker pool
+	// When full, Accept blocks (backpressure) instead of rejecting.
+	var sem chan struct{}
+	if cfg.MaxConns > 0 {
+		sem = make(chan struct{}, cfg.MaxConns)
+		log.Printf("max concurrent connections set to %d", cfg.MaxConns)
+	}
+
 	for {
 		conn, err := tlsLn.Accept()
 		if err != nil {
@@ -517,10 +527,24 @@ func RunWithContext(ctx context.Context, cfg *AppConfig, certPath, keyPath, list
 			log.Printf("TLS accept error: %v", err)
 			continue
 		}
+
+		// Acquire semaphore slot (blocks if at capacity, providing backpressure)
+		if sem != nil {
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				conn.Close()
+				return
+			}
+		}
+
 		// Track connection
 		id := nextSessionID()
 		activeConns.Store(id, conn)
 		go func(id string, conn net.Conn) {
+			if sem != nil {
+				defer func() { <-sem }()
+			}
 			defer activeConns.Delete(id)
 			handleClient(conn, cfg)
 		}(id, conn)

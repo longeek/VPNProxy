@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -146,45 +147,56 @@ func putRelayBuf(b []byte) {
 	relayBufPool.Put(&b)
 }
 
-// relayCopy performs efficient unidirectional copy with statistics tracking
-func relayCopy(src, dst net.Conn, stats *uint64, buf []byte) {
-	for {
-		n, err := src.Read(buf)
-		if n > 0 {
-			if _, werr := dst.Write(buf[:n]); werr != nil {
-				break
-			}
-			if stats != nil {
-				atomic.AddUint64(stats, uint64(n))
-			}
-		}
-		if err != nil {
-			break
-		}
-	}
+// bufWriterPool pools bufio.Writer objects to reduce per-connection allocations.
+// Each writer is pre-allocated with PipeBufSize internal buffer.
+var bufWriterPool = sync.Pool{
+	New: func() any {
+		return bufio.NewWriterSize(nil, PipeBufSize)
+	},
 }
 
+// GetBufWriter retrieves a pooled bufio.Writer and resets it to the given writer.
+func GetBufWriter(w io.Writer) *bufio.Writer {
+	bw := bufWriterPool.Get().(*bufio.Writer)
+	bw.Reset(w)
+	return bw
+}
+
+// PutBufWriter resets the writer to discard (safe nil-free reset) and returns it to the pool.
+func PutBufWriter(bw *bufio.Writer) {
+	bw.Reset(io.Discard)
+	bufWriterPool.Put(bw)
+}
+
+// RelayBidirectional copies data in both directions between client and tunnel.
+// Uses io.CopyBuffer for zero-copy splice(2) on Linux when both sides are *net.TCPConn.
 func RelayBidirectional(client, tunnel net.Conn, upStats, downStats *uint64) {
-	bufUp := getRelayBuf()
-	bufDown := getRelayBuf()
-	done := make(chan struct{}, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
 
 	go func() {
-		defer putRelayBuf(bufUp)
-		relayCopy(client, tunnel, upStats, bufUp)
+		defer wg.Done()
+		buf := getRelayBuf()
+		defer putRelayBuf(buf)
+		n, _ := io.CopyBuffer(tunnel, client, buf)
 		tunnel.Close()
-		done <- struct{}{}
+		if upStats != nil {
+			atomic.AddUint64(upStats, uint64(n))
+		}
 	}()
 
 	go func() {
-		defer putRelayBuf(bufDown)
-		relayCopy(tunnel, client, downStats, bufDown)
+		defer wg.Done()
+		buf := getRelayBuf()
+		defer putRelayBuf(buf)
+		n, _ := io.CopyBuffer(client, tunnel, buf)
 		client.Close()
-		done <- struct{}{}
+		if downStats != nil {
+			atomic.AddUint64(downStats, uint64(n))
+		}
 	}()
 
-	<-done
-	<-done
+	wg.Wait()
 }
 
 func RelayTCPServer(tlsConn, target net.Conn, stats *SessionStats) {
@@ -194,7 +206,8 @@ func RelayTCPServer(tlsConn, target net.Conn, stats *SessionStats) {
 
 	go func() {
 		defer putRelayBuf(bufUp)
-		bw := bufio.NewWriterSize(target, PipeBufSize)
+		bw := GetBufWriter(target)
+		defer PutBufWriter(bw)
 		pending := 0
 		for {
 			n, err := tlsConn.Read(bufUp)
@@ -224,7 +237,8 @@ func RelayTCPServer(tlsConn, target net.Conn, stats *SessionStats) {
 
 	go func() {
 		defer putRelayBuf(bufDown)
-		bw := bufio.NewWriterSize(tlsConn, PipeBufSize)
+		bw := GetBufWriter(tlsConn)
+		defer PutBufWriter(bw)
 		pending := 0
 		for {
 			n, err := target.Read(bufDown)

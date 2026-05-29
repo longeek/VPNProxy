@@ -393,8 +393,9 @@ sudo bash scripts/linux_quick_monitor.sh --follow
 
 执行内容：
 
-- Python `3.9` 与 `3.11` 矩阵测试
-- 调用 `scripts/test.sh`
+- **Go** `go build ./...` + `go vet ./...` + `go test ./...`（自动缓存依赖）
+- Python `3.9` 与 `3.11` 矩阵测试（调用 `scripts/test.sh`）
+- **Go 测试失败会阻止打包发布**
 
 ### 15.2 自动打包
 
@@ -450,6 +451,89 @@ powershell -ExecutionPolicy Bypass -File .\scripts\windows_wsl_test.ps1 -Distro 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\windows_wsl_test.ps1 -Distro Ubuntu -InstallDeps
 ```
+
+## 17. Go 实现（高性能替代）
+
+项目包含一个完整的 **Go 实现** (`vpn-proxy-go/`)，与 Python 版本完全互操作（相同 JSON 引导协议、相同的帧格式）。
+
+### 17.1 Go vs Python 性能对比
+
+| 指标 | Python | Go |
+|------|:------:|:--:|
+| **Tunnel Setup (mean)** | ~7.7ms | ~8.7ms |
+| **Tunnel Setup (median)** | ~7.3ms | ~8.9ms |
+| **代码行数** | 1,435 | 1,823 |
+| **测试行数** | 有 | 1,077 |
+| **依赖** | stdlib 仅 | 无外部依赖 |
+
+> 注：本地环回测试中两者延迟接近，Go 的优势在高并发/高吞吐场景下更明显。
+
+### 17.2 Go 额外优化特性
+
+- ✅ **DNS 缓存**（含负缓存，TTL=30s）
+- ✅ **Rate Limiting**（令牌桶，默认 100/s burst=20）
+- ✅ **TLS Session Cache**（LRU 128 条目）
+- ✅ **Buffer Pooling**（sync.Pool 复用 relay + write buffer）
+- ✅ **Keepalive**（30s 检测半开连接）
+- ✅ **优雅关闭**（signal + drain timeout）
+- ✅ **pprof 内置性能分析**
+
+### 17.3 编译与运行（Go Server）
+
+```bash
+cd vpn-proxy-go
+
+# 编译
+go build -o bin/vpn-proxy-server.exe ./cmd/server
+
+# 运行（参数与 Python 版本兼容）
+./bin/vpn-proxy-server \
+  --listen 0.0.0.0 \
+  --port 8443 \
+  --cert ./certs/server.crt \
+  --key ./certs/server.key \
+  --token "YOUR_LONG_RANDOM_TOKEN"
+
+# 启用 pprof 性能分析（可选）
+./bin/vpn-proxy-server \
+  --listen 0.0.0.0 --port 8443 \
+  --cert ./certs/server.crt --key ./certs/server.key \
+  --token "TOKEN" \
+  --pprof-addr localhost:6060
+# 然后在浏览器打开 http://localhost:6060/debug/pprof/
+```
+
+### 17.4 编译与运行（Go Client）
+
+```bash
+cd vpn-proxy-go
+go build -o bin/vpn-proxy-client.exe ./cmd/client
+
+# 运行（参数与 Python 客户端兼容）
+./bin/vpn-proxy-client \
+  --listen 127.0.0.1 \
+  --listen-port 1080 \
+  --server <服务器> \
+  --server-port 8443 \
+  --token "YOUR_LONG_RANDOM_TOKEN"
+```
+
+### 17.5 与 Python 版本互操作
+
+Go 客户端可连接 Python 服务端，Go 服务端也可接受 Python 客户端连接——两者使用相同的 TLS 隧道协议和 JSON 引导格式。
+
+### 17.6 CI/CD 集成
+
+GitHub Actions 工作流已添加 `go-test` 任务，每次推送自动执行：
+
+```yaml
+# 自动执行：
+# - go build ./...
+# - go vet ./...
+# - go test ./... -v -count=1 -timeout 120s
+```
+
+Go 测试通过后才会执行打包发布步骤。
 
 ### 16.2 这套测试覆盖什么
 
