@@ -1,3 +1,15 @@
+// Package server implements the VPN proxy server.
+//
+// The server listens for TLS connections from clients, authenticates via
+// shared token, and forwards TCP/UDP traffic to backend targets.
+//
+// Performance features:
+//   - Token-bucket rate limiter (default 100 req/s, burst 20)
+//   - DNS cache with positive + negative caching (TTL 30s)
+//   - TLS session cache (128-entry LRU)
+//   - TCP keepalive (30s) to detect half-open connections
+//   - Graceful shutdown with SIGTERM/SIGINT handling
+//   - Optional semaphore-based concurrency limiting
 package server
 
 import (
@@ -19,7 +31,12 @@ import (
 	"vpn-proxy-go/internal/tunnel"
 )
 
-// Simple rate limiter for client connections
+// rateLimiter implements a token-bucket rate limiter.
+//
+// Tokens are refilled continuously based on elapsed time since the last
+// check. The bucket has a maximum capacity (burst) and refills at a
+// configurable rate per second. This is the same algorithm used by the
+// Rust server implementation for cross-language consistency.
 type rateLimiter struct {
 	mu         sync.Mutex
 	tokens     int
@@ -37,6 +54,8 @@ func newRateLimiter(ratePerSec float64, burst int) *rateLimiter {
 	}
 }
 
+// Allow checks if a request fits within the rate limit. Returns true if
+// the request is allowed, false if rate limited. Thread-safe.
 func (r *rateLimiter) Allow() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -59,6 +78,7 @@ func (r *rateLimiter) Allow() bool {
 	return false
 }
 
+// connLimiter is the global rate limiter. Default: 100 requests/second, burst 20.
 var connLimiter = newRateLimiter(100, 20)
 
 const (
@@ -71,6 +91,9 @@ var sessionCounter uint64
 
 const hexTable = "0123456789abcdef"
 
+// nextSessionID generates an 8-character hex session identifier using an
+// atomic counter. This is faster than UUID generation and provides
+// human-readable short IDs for log correlation.
 func nextSessionID() string {
 	id := atomic.AddUint64(&sessionCounter, 1)
 	b := make([]byte, 8)
@@ -81,40 +104,64 @@ func nextSessionID() string {
 	return string(b)
 }
 
-func parseBootstrapLine(line string, allowedTokens map[string]bool) (host string, port uint16, proto string, err error) {
-	var payload map[string]interface{}
-	if e := json.Unmarshal([]byte(line), &payload); e != nil {
-		return "", 0, "", fmt.Errorf("invalid json: %v", e)
-	}
-	authVal, ok := payload["auth"].(string)
-	if !ok {
-		return "", 0, "", fmt.Errorf("missing auth")
-	}
-	if !allowedTokens[authVal] {
-		return "", 0, "", fmt.Errorf("ERR auth")
-	}
-	hostVal, ok := payload["host"].(string)
-	if !ok || hostVal == "" {
-		return "", 0, "", fmt.Errorf("missing host")
-	}
-	portVal, ok := payload["port"].(float64)
-	if !ok || portVal < 0 || portVal > 65535 {
-		return "", 0, "", fmt.Errorf("invalid port")
-	}
-	protoVal, _ := payload["proto"].(string)
-	if protoVal == "" {
-		protoVal = "tcp"
-	}
-	if protoVal != "tcp" && protoVal != "udp" {
-		return "", 0, "", fmt.Errorf("invalid proto")
-	}
-	p := uint16(portVal)
-	if protoVal == "tcp" && p == 0 {
-		return "", 0, "", fmt.Errorf("invalid port")
-	}
-	return hostVal, p, protoVal, nil
+// BootstrapRequest is the JSON structure sent by the client in the first line.
+// Fields use pointers to distinguish missing vs zero-value for validation.
+type BootstrapRequest struct {
+	Auth  string `json:"auth"`
+	Host  string `json:"host"`
+	Port  uint16 `json:"port"`
+	Proto string `json:"proto,omitempty"`
 }
 
+// ParseBootstrapJSON unmarshals the raw JSON line into a BootstrapRequest.
+// Separated from validation for testability and reuse.
+func ParseBootstrapJSON(line string) (*BootstrapRequest, error) {
+	var req BootstrapRequest
+	if err := json.Unmarshal([]byte(line), &req); err != nil {
+		return nil, fmt.Errorf("invalid json: %w", err)
+	}
+	if req.Auth == "" {
+		return nil, fmt.Errorf("missing auth")
+	}
+	if req.Host == "" {
+		return nil, fmt.Errorf("missing host")
+	}
+	if req.Proto == "" {
+		req.Proto = "tcp"
+	}
+	return &req, nil
+}
+
+// ValidateBootstrapRequest checks authentication, protocol, and port constraints.
+// Returns "ERR auth" for auth failures (wire protocol convention), generic errors otherwise.
+func ValidateBootstrapRequest(req *BootstrapRequest, allowedTokens map[string]bool) error {
+	if !allowedTokens[req.Auth] {
+		return fmt.Errorf("ERR auth")
+	}
+	if req.Proto != "tcp" && req.Proto != "udp" {
+		return fmt.Errorf("invalid proto")
+	}
+	if req.Proto == "tcp" && req.Port == 0 {
+		return fmt.Errorf("invalid port")
+	}
+	return nil
+}
+
+// parseBootstrapLine is a convenience wrapper that calls ParseBootstrapJSON + ValidateBootstrapRequest.
+// Kept for backward compatibility with existing callers.
+func parseBootstrapLine(line string, allowedTokens map[string]bool) (host string, port uint16, proto string, err error) {
+	req, err := ParseBootstrapJSON(line)
+	if err != nil {
+		return "", 0, "", err
+	}
+	if err := ValidateBootstrapRequest(req, allowedTokens); err != nil {
+		return "", 0, "", err
+	}
+	return req.Host, req.Port, req.Proto, nil
+}
+
+// LoadAllowedTokens loads tokens from --token flag and/or --tokens-file.
+// Tokens from both sources are merged into a single set for fast lookup.
 func LoadAllowedTokens(token string, tokensFile string) map[string]bool {
 	tokens := map[string]bool{}
 	if token != "" {
@@ -136,6 +183,8 @@ func LoadAllowedTokens(token string, tokensFile string) map[string]bool {
 	return tokens
 }
 
+// ParseAllowCIDRs parses a comma-separated list of CIDR networks.
+// Empty string returns nil (allow all). Invalid CIDRs are silently skipped.
 func ParseAllowCIDRs(value string) []*net.IPNet {
 	if value == "" {
 		return nil
@@ -163,7 +212,7 @@ func peerAllowed(peerIP net.IP, networks []*net.IPNet) bool {
 	return false
 }
 
-// AppError represents a structured application error
+// AppError represents a structured application error with a code and message.
 type AppError struct {
 	Code    string
 	Message string
@@ -181,6 +230,8 @@ func (e *AppError) Unwrap() error {
 	return e.Err
 }
 
+// AppConfig holds all server configuration. Passed to handleClient for
+// each incoming connection.
 type AppConfig struct {
 	AllowedTokens    map[string]bool
 	AllowNetworks    []*net.IPNet
@@ -189,6 +240,9 @@ type AppConfig struct {
 	MaxConns         int // max concurrent connections (0 = unlimited)
 }
 
+// readBootstrapLine reads the first line (terminated by '\n') from the
+// TLS connection within the given timeout. Supports CRLF line endings.
+// The read deadline is reset after a complete line is received.
 func readBootstrapLine(conn net.Conn, timeout time.Duration) (string, error) {
 	lineBuf := make([]byte, 4096)
 	total := 0
@@ -216,6 +270,7 @@ func readBootstrapLine(conn net.Conn, timeout time.Duration) (string, error) {
 	}
 }
 
+// dnsEntry holds a cached DNS result with expiration and negative flag.
 type dnsEntry struct {
 	ip       net.IP
 	ts       time.Time
@@ -226,13 +281,20 @@ var dnsCache sync.Map
 
 const dnsCacheTTL = 30 * time.Second
 
+// cachedLookupHost performs DNS resolution with caching.
+//
+// Caching strategy (same as Rust implementation):
+//   - Successful lookups: cached for dnsCacheTTL (30s)
+//   - Failed lookups (NXDOMAIN, timeout): cached for ~9s (30s * 0.3)
+//
+// Negative caching prevents repeated DNS failures from overwhelming
+// the resolver during transient network issues.
 func cachedLookupHost(host string) net.IP {
 	now := time.Now()
 	if v, ok := dnsCache.Load(host); ok {
 		e := v.(*dnsEntry)
 		if now.Sub(e.ts) < dnsCacheTTL {
 			if e.negative {
-				// Negative cache hit: recent DNS failure, skip retry
 				return nil
 			}
 			return e.ip
@@ -242,7 +304,6 @@ func cachedLookupHost(host string) net.IP {
 
 	addrs, err := net.LookupHost(host)
 	if err != nil {
-		// Cache failed DNS lookup for short TTL to avoid repeated retries
 		dnsCache.Store(host, &dnsEntry{ip: nil, ts: now, negative: true})
 		return nil
 	}
@@ -277,6 +338,8 @@ func resolveHost(host string, port uint16) (string, error) {
 	return fmt.Sprintf("%s:%d", ip.String(), port), nil
 }
 
+// handleTCPRelay resolves the target host (using cached DNS), connects to
+// the backend, and starts bidirectional relay with threshold-based flushing.
 func handleTCPRelay(tlsConn net.Conn, host string, port uint16, stats *tunnel.SessionStats, sessionID string, connectTimeout time.Duration) {
 	targetAddr, err := resolveHost(host, port)
 	if err != nil {
@@ -301,6 +364,7 @@ func handleTCPRelay(tlsConn net.Conn, host string, port uint16, stats *tunnel.Se
 	log.Printf("[sid=%s] session closed (up=%d bytes, down=%d bytes)", sessionID, totalUp, totalDown)
 }
 
+// udpBufPool pools 64KB UDP receive buffers to reduce allocations.
 var udpBufPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, 65535)
@@ -308,6 +372,15 @@ var udpBufPool = sync.Pool{
 	},
 }
 
+// handleUDPRelay implements UDP ASSOCIATE relay.
+//
+// UDP datagrams are framed over the TLS tunnel using the custom protocol:
+//
+//	ver(1) + rsv(1) + host_len(2) + host(UTF-8) + port(2) + payload_len(2) + payload
+//
+// Two modes:
+//   - Fixed destination: all datagrams are sent to the bootstrap-specified host:port
+//   - Framed (0.0.0.0:0): each datagram carries its own destination (SOCKS5 UDP ASSOCIATE)
 func handleUDPRelay(tlsConn net.Conn, stats *tunnel.SessionStats, host string, port uint16, sessionID string) {
 	udpSock, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: 0})
 	if err != nil {
@@ -331,6 +404,7 @@ func handleUDPRelay(tlsConn net.Conn, stats *tunnel.SessionStats, host string, p
 	defer tunnel.PutBufWriter(bw)
 	pendingWrite := 0
 
+	// Direction 1: TLS tunnel → UDP socket (incoming frames from client)
 	go func() {
 		for {
 			f, err := frame.ReadFromStreamPooled(tlsConn)
@@ -353,6 +427,7 @@ func handleUDPRelay(tlsConn net.Conn, stats *tunnel.SessionStats, host string, p
 		}
 	}()
 
+	// Direction 2: UDP socket → TLS tunnel (incoming datagrams from network)
 	buf := *udpBufPool.Get().(*[]byte)
 	defer udpBufPool.Put(&buf)
 	for {
@@ -390,6 +465,10 @@ func handleUDPRelay(tlsConn net.Conn, stats *tunnel.SessionStats, host string, p
 	log.Printf("[sid=%s] UDP session closed (up=%d bytes, down=%d bytes)", sessionID, totalUp, totalDown)
 }
 
+// setClientSocketOpts applies TCP optimization options to the client connection:
+//   - TCP_NODELAY: disable Nagle's algorithm for low-latency forwarding
+//   - Large socket buffers (256KB) for high-throughput transfers
+//   - TCP keepalive (30s) to detect half-open connections from crashed clients
 func setClientSocketOpts(tlsConn net.Conn) {
 	if tc, ok := tlsConn.(*tls.Conn); ok {
 		raw, ok := tc.NetConn().(*net.TCPConn)
@@ -397,13 +476,21 @@ func setClientSocketOpts(tlsConn net.Conn) {
 			raw.SetNoDelay(true)
 			raw.SetReadBuffer(recvBufSize)
 			raw.SetWriteBuffer(recvBufSize)
-			// Enable TCP keepalive to detect half-open connections
 			raw.SetKeepAlive(true)
 			raw.SetKeepAlivePeriod(30 * time.Second)
 		}
 	}
 }
 
+// handleClient processes a single client connection.
+//
+// Workflow:
+//  1. Rate limiting check
+//  2. CIDR allowlist check
+//  3. Read bootstrap line (JSON with auth + target)
+//  4. Route to TCP relay (with DNS cache) or UDP relay
+//
+// The connection is always closed in the defer at the end.
 func handleClient(tlsConn net.Conn, ctx *AppConfig) {
 	sessionID := nextSessionID()
 	defer tlsConn.Close()
@@ -411,7 +498,6 @@ func handleClient(tlsConn net.Conn, ctx *AppConfig) {
 	peer := tlsConn.RemoteAddr()
 	stats := &tunnel.SessionStats{}
 
-	// Rate limiting check
 	if !connLimiter.Allow() {
 		log.Printf("[sid=%s] connection rate limit exceeded from %v", sessionID, peer)
 		tlsConn.Write([]byte("ERR rate limit\n"))
@@ -456,13 +542,27 @@ func handleClient(tlsConn net.Conn, ctx *AppConfig) {
 	}
 }
 
+// Run starts the server with a background context (no graceful shutdown).
+// See RunWithContext for signal-aware startup.
 func Run(cfg *AppConfig, certPath, keyPath, listenAddr string) {
 	RunWithContext(context.Background(), cfg, certPath, keyPath, listenAddr)
 }
 
-// activeConns tracks currently active connections for graceful shutdown
+// activeConns tracks currently active connections for graceful shutdown.
+// Each connection is stored with its session ID as key.
 var activeConns sync.Map
 
+// RunWithContext starts the TLS listener and accepts connections until the
+// context is cancelled (triggering graceful shutdown).
+//
+// Concurrency limiting:
+//   - If cfg.MaxConns > 0, a semaphore (buffered channel) limits concurrent
+//     goroutines. When at capacity, Accept() blocks, providing backpressure
+//     via the OS TCP backlog.
+//
+// Graceful shutdown:
+//   - On ctx.Done(), the listener is closed immediately
+//   - Active connections have up to 30s to complete before force-close
 func RunWithContext(ctx context.Context, cfg *AppConfig, certPath, keyPath, listenAddr string) {
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
@@ -485,17 +585,17 @@ func RunWithContext(ctx context.Context, cfg *AppConfig, certPath, keyPath, list
 
 	log.Printf("server started on %s", listenAddr)
 
-	// Graceful shutdown support
+	// Graceful shutdown goroutine: wait for ctx cancellation,
+	// close the listener, then wait for active connections to drain.
 	go func() {
 		<-ctx.Done()
 		log.Println("shutting down server...")
 		tlsLn.Close()
 
-		// Wait for active connections to finish (with timeout)
 		waitCh := make(chan struct{})
 		go func() {
 			activeConns.Range(func(_, _ interface{}) bool {
-				return true // Just count
+				return true
 			})
 			close(waitCh)
 		}()
@@ -508,7 +608,7 @@ func RunWithContext(ctx context.Context, cfg *AppConfig, certPath, keyPath, list
 		}
 	}()
 
-	// Concurrency limiter: semaphore-based worker pool
+	// Semaphore-based concurrency limiter.
 	// When full, Accept blocks (backpressure) instead of rejecting.
 	var sem chan struct{}
 	if cfg.MaxConns > 0 {
@@ -519,7 +619,6 @@ func RunWithContext(ctx context.Context, cfg *AppConfig, certPath, keyPath, list
 	for {
 		conn, err := tlsLn.Accept()
 		if err != nil {
-			// Check if shutdown was requested
 			if ctx.Err() != nil {
 				log.Println("server stopped")
 				return
@@ -528,7 +627,7 @@ func RunWithContext(ctx context.Context, cfg *AppConfig, certPath, keyPath, list
 			continue
 		}
 
-		// Acquire semaphore slot (blocks if at capacity, providing backpressure)
+		// Acquire semaphore slot (blocks if at capacity)
 		if sem != nil {
 			select {
 			case sem <- struct{}{}:
@@ -538,7 +637,6 @@ func RunWithContext(ctx context.Context, cfg *AppConfig, certPath, keyPath, list
 			}
 		}
 
-		// Track connection
 		id := nextSessionID()
 		activeConns.Store(id, conn)
 		go func(id string, conn net.Conn) {

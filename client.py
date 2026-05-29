@@ -16,6 +16,8 @@ import time
 import uuid
 from typing import Optional
 
+from vpn_proxy_frame import UDP_FRAME_VERSION, pack_udp_frame, read_udp_frame
+
 
 LOG = logging.getLogger("vpn-proxy-client")
 
@@ -69,9 +71,6 @@ class TcpLineTargetError(ValueError):
 
 class ProxyAuthError(ValueError):
     pass
-
-
-UDP_FRAME_VERSION = 1
 
 
 async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -379,34 +378,9 @@ def map_socks_reply(exc: BaseException) -> int:
     return 0x01
 
 
-def pack_udp_frame(host: str, port: int, data: bytes) -> bytes:
-    hb = host.encode("utf-8")
-    if len(hb) > 1024:
-        raise ValueError("host too long")
-    if len(data) > 65535:
-        raise ValueError("datagram too large")
-    return (
-        bytes([UDP_FRAME_VERSION, 0])
-        + len(hb).to_bytes(2, "big")
-        + hb
-        + struct.pack("!HH", port, len(data))
-        + data
-    )
-
-
 async def read_udp_tunnel_frame(reader: asyncio.StreamReader) -> tuple[str, int, bytes]:
-    ver_rsv_nlen = await read_exact(reader, 4)
-    ver, _rsv, nlen = ver_rsv_nlen[0], ver_rsv_nlen[1], int.from_bytes(ver_rsv_nlen[2:4], "big")
-    if ver != UDP_FRAME_VERSION:
-        raise ValueError("bad udp frame version")
-    if nlen == 0 or nlen > 1024:
-        raise ValueError("bad udp frame host length")
-    host = (await read_exact(reader, nlen)).decode("utf-8", errors="replace")
-    port_dlen = await read_exact(reader, 4)
-    port, dlen = struct.unpack("!HH", port_dlen)
-    if dlen > 65535:
-        raise ValueError("bad udp frame payload length")
-    data = await read_exact(reader, dlen) if dlen else b""
+    # Delegate to shared read_udp_frame, discard wire_len
+    host, port, data, _wire_len = await read_udp_frame(reader)
     return host, port, data
 
 

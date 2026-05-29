@@ -1,4 +1,16 @@
-use std::net::SocketAddr;
+//! VPN proxy server — Rust implementation (tokio + rustls).
+//!
+//! Accepts TLS connections from clients, authenticates via shared token,
+//! and forwards TCP/UDP traffic to backend targets. Performance features:
+//!
+//! - **Rate limiting**: token-bucket (default 100 req/s, burst 20)
+//! - **Connection pool**: shared via server_logic::TunnelPool
+//! - **DNS cache**: uses dns_cache module (30s TTL, negative caching)
+//! - **TLS session cache**: enabled by default in rustls
+//!
+//! Wire protocol is identical to the Python and Go implementations.
+
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -9,6 +21,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, info, warn, Level};
 use tracing_subscriber::EnvFilter;
 
+use vpn_proxy::dns_cache::DnsCache;
 use vpn_proxy::server_logic::{
     load_allowed_tokens, next_session_id, pack_udp_frame, parse_allow_cidrs,
     parse_bootstrap_line, peer_allowed, BootstrapInfo,
@@ -52,12 +65,49 @@ impl RateLimiter {
     }
 }
 
+/// Global rate limiter instance, lazily initialized with defaults.
+/// Re-initialized at startup with values from CLI args via init_rate_limiter().
 static CONN_LIMITER: LazyLock<Mutex<RateLimiter>> =
     LazyLock::new(|| Mutex::new(RateLimiter::new(100.0, 20.0)));
 
+/// Override the global rate limiter with values from CLI arguments.
+/// Called once at startup after parsing command-line flags.
 fn init_rate_limiter(rate_per_sec: f64, burst: u32) {
     let mut limiter = CONN_LIMITER.lock().unwrap();
     *limiter = RateLimiter::new(rate_per_sec, burst as f64);
+}
+
+/// Global DNS cache with 30s TTL (same as Go and Python implementations).
+static DNS_CACHE: LazyLock<DnsCache> = LazyLock::new(|| DnsCache::new(Duration::from_secs(30)));
+
+/// Resolve host to IP address with caching.
+///
+/// Checks the global DNS cache first. On cache miss, performs async DNS
+/// resolution via `tokio::net::lookup_host`, prefers IPv4, and stores the
+/// result (or None on failure) for the cache TTL.
+async fn cached_lookup_host(host: &str) -> Option<IpAddr> {
+    // Fast path: cache hit
+    if let Some(ip) = DNS_CACHE.lookup(host) {
+        return Some(ip);
+    }
+    // Cache miss: resolve and store
+    let port_42 = 42u16; // arbitrary port; lookup_host requires (host, port)
+    let addrs = tokio::net::lookup_host((host, port_42)).await;
+    match addrs {
+        Ok(mut addrs) => {
+            // Prefer IPv4, fallback to any
+            let ip = addrs.find(|a| a.is_ipv4())
+                .or_else(|| addrs.next())
+                .map(|a| a.ip());
+            DNS_CACHE.store(host.to_string(), ip);
+            ip
+        }
+        Err(_) => {
+            // Negative cache: store failure to avoid repeated retries
+            DNS_CACHE.store(host.to_string(), None);
+            None
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -100,6 +150,10 @@ fn set_socket_opts(stream: &TcpStream) {
     let _ = sock.set_nodelay(true);
     let _ = sock.set_recv_buffer_size(RECV_BUF_SIZE);
     let _ = sock.set_send_buffer_size(RECV_BUF_SIZE);
+    // TCP keepalive (30s) to detect half-open connections (same as Go/Python)
+    let _ = sock.set_keepalive(true);
+    let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));
+    let _ = sock.set_tcp_keepalive(&ka);
 }
 
 #[derive(Debug)]
@@ -116,9 +170,13 @@ impl From<BootstrapInfo> for BootstrapInfo_ {
 }
 
 fn parse_bootstrap(line: &str, allowed_tokens: &[String]) -> Result<BootstrapInfo_, String> {
-    parse_bootstrap_line(line, allowed_tokens).map(Into::into)
+    parse_bootstrap_line(line, allowed_tokens)
+        .map(Into::into)
+        .map_err(|e| e.to_string())
 }
 
+/// Per-session byte counters, shared across relay tasks via Arc.
+/// Uses atomic operations for lock-free concurrent updates.
 struct SessionStats {
     upload_bytes: AtomicU64,
     download_bytes: AtomicU64,
@@ -220,17 +278,13 @@ async fn run_udp_relay(
             };
             let send_host = fixed_host_1.as_deref().unwrap_or(&frame.host);
             let send_port = fixed_port_1.unwrap_or(frame.port);
-            let addr_result = tokio::net::lookup_host((send_host, send_port)).await;
-            let addr = match addr_result {
-                Ok(mut addrs) => addrs.find(|a| a.is_ipv4()).or_else(|| addrs.next()),
-                Err(e) => {
-                    debug!("[sid={sid1}] UDP DNS lookup failed: {e}");
+            let ip = cached_lookup_host(send_host).await;
+            let addr = match ip {
+                Some(ip) => SocketAddr::new(ip, send_port),
+                None => {
+                    debug!("[sid={sid1}] UDP DNS lookup failed for {send_host}");
                     continue;
                 }
-            };
-            let addr = match addr {
-                Some(a) => a,
-                None => continue,
             };
             if let Err(e) = udp1.send_to(&frame.data, addr).await {
                 debug!("[sid={sid1}] UDP sendto failed: {e}");
@@ -418,6 +472,8 @@ async fn handle_tcp_relay(
     );
 }
 
+/// Shared application context passed to each connection handler.
+/// Cloned cheaply via Arc for use across async tasks.
 struct AppContext {
     allowed_tokens: Arc<Vec<String>>,
     allow_networks: Vec<ipnet::IpNet>,
@@ -513,20 +569,14 @@ async fn handle_client(tls_stream: TlsStream, ctx: Arc<AppContext>) {
     if info.proto == "udp" {
         run_udp_relay(tls, stats, info.host, info.port, session_id).await;
     } else {
-        let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((&info.host[..], info.port)).await {
-            Ok(a) => a.collect(),
-            Err(e) => {
-                warn!("[sid={session_id}] DNS lookup failed for {}:{}: {e}", info.host, info.port);
-                return;
-            }
-        };
-        let addr = match addrs.iter().find(|a| a.is_ipv4()).or_else(|| addrs.first()) {
-            Some(a) => *a,
+        let ip = match cached_lookup_host(&info.host).await {
+            Some(ip) => ip,
             None => {
-                warn!("[sid={session_id}] no address found for {}:{}", info.host, info.port);
+                warn!("[sid={session_id}] DNS lookup failed for {}:{}", info.host, info.port);
                 return;
             }
         };
+        let addr = SocketAddr::new(ip, info.port);
 
         let _ = tls.write_all(b"OK\n").await;
         let _ = tls.flush().await;

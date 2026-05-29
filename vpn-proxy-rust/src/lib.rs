@@ -92,38 +92,55 @@ pub mod server_logic {
         networks.iter().any(|net| net.contains(&peer_ip))
     }
 
-    pub fn parse_bootstrap_line(line: &str, allowed_tokens: &[String]) -> Result<BootstrapInfo, String> {
-        let payload: serde_json::Value =
-            serde_json::from_str(line).map_err(|e| format!("invalid json: {e}"))?;
+    /// Errors that can occur during bootstrap line parsing.
+    /// Replaces the old `Result<T, String>` pattern with typed error variants.
+    #[derive(Debug, thiserror::Error)]
+    pub enum BootstrapError {
+        #[error("invalid json: {0}")]
+        InvalidJson(#[from] serde_json::Error),
+        #[error("missing auth")]
+        MissingAuth,
+        #[error("ERR auth")]
+        AuthFailed,
+        #[error("missing host")]
+        MissingHost,
+        #[error("invalid port")]
+        InvalidPort,
+        #[error("invalid proto")]
+        InvalidProto,
+    }
+
+    pub fn parse_bootstrap_line(line: &str, allowed_tokens: &[String]) -> Result<BootstrapInfo, BootstrapError> {
+        let payload: serde_json::Value = serde_json::from_str(line)?;
         let token = payload
             .get("auth")
             .and_then(|v| v.as_str())
-            .ok_or("missing auth")?;
+            .ok_or(BootstrapError::MissingAuth)?;
         if !allowed_tokens.iter().any(|t| t == token) {
-            return Err("ERR auth".to_string());
+            return Err(BootstrapError::AuthFailed);
         }
         let host = payload
             .get("host")
             .and_then(|v| v.as_str())
-            .ok_or("missing host")?
+            .ok_or(BootstrapError::MissingHost)?
             .to_string();
         let port = payload
             .get("port")
             .and_then(|v| v.as_u64())
-            .ok_or("missing port")?;
+            .ok_or(BootstrapError::InvalidPort)?;
         let proto = payload
             .get("proto")
             .and_then(|v| v.as_str())
             .unwrap_or("tcp")
             .to_string();
         if proto != "tcp" && proto != "udp" {
-            return Err("invalid proto".to_string());
+            return Err(BootstrapError::InvalidProto);
         }
         if port > 65535 {
-            return Err("invalid port".to_string());
+            return Err(BootstrapError::InvalidPort);
         }
         if proto == "tcp" && port == 0 {
-            return Err("invalid port".to_string());
+            return Err(BootstrapError::InvalidPort);
         }
         Ok(BootstrapInfo {
             host,
@@ -333,7 +350,7 @@ pub mod server_logic {
                 r#"{"auth":"badtoken","host":"example.com","port":443}"#,
                 &tokens,
             );
-            assert_eq!(result.unwrap_err(), "ERR auth");
+            assert!(matches!(result.unwrap_err(), BootstrapError::AuthFailed));
         }
 
         #[test]

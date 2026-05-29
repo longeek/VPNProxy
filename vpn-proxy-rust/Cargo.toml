@@ -30,6 +30,7 @@ base64 = "0.22"
 rand = "0.8"
 rustls-native-certs = "0.7"
 ipnet = "2"
+thiserror = "2"
 
 [dev-dependencies]
 tokio-test = "0.4"

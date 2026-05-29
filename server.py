@@ -13,6 +13,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Optional
 
+from vpn_proxy_frame import UDP_FRAME_VERSION, pack_udp_frame, read_exact, read_udp_frame
+
 
 LOG = logging.getLogger("vpn-proxy-server")
 
@@ -21,8 +23,40 @@ class AuthError(Exception):
     pass
 
 
+class _RateLimiter:
+    """Token-bucket rate limiter (transplanted from Go implementation).
+
+    Default: 100 tokens/sec, burst of 20 connections.
+    Thread-safe via threading.Lock for use across async tasks.
+    """
+
+    def __init__(self, rate_per_sec: float = 100.0, burst: int = 20) -> None:
+        self._rate = rate_per_sec
+        self._max_tokens = burst
+        self._tokens = burst
+        self._last_refill = time.monotonic()
+        self._lock = __import__("threading").Lock()
+
+    def allow(self) -> bool:
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_refill
+            new_tokens = int(elapsed * self._rate)
+            if new_tokens > 0:
+                self._tokens = min(self._tokens + new_tokens, self._max_tokens)
+                self._last_refill = now
+            if self._tokens > 0:
+                self._tokens -= 1
+                return True
+            return False
+
+
+_conn_limiter = _RateLimiter()
+
+
 class _DnsEntry:
     __slots__ = ("ip", "expires")
+
     def __init__(self, ip: Optional[str], expires: float) -> None:
         self.ip = ip
         self.expires = expires
@@ -223,44 +257,8 @@ def parse_bootstrap_line(line: bytes, allowed_tokens: set[str]) -> tuple[str, in
     return host, port, proto
 
 
-UDP_FRAME_VERSION = 1
-
-
-async def read_exact(reader: asyncio.StreamReader, n: int) -> bytes:
-    return await reader.readexactly(n)
-
-
-async def read_udp_frame_from_tls(reader: asyncio.StreamReader) -> tuple[str, int, bytes, int]:
-    ver_rsv_nlen = await read_exact(reader, 4)
-    ver, _rsv, nlen = ver_rsv_nlen[0], ver_rsv_nlen[1], int.from_bytes(ver_rsv_nlen[2:4], "big")
-    if ver != UDP_FRAME_VERSION:
-        raise ValueError("bad udp frame version")
-    if nlen == 0 or nlen > 1024:
-        raise ValueError("bad udp frame host length")
-    host_b = await read_exact(reader, nlen)
-    host = host_b.decode("utf-8", errors="replace")
-    port_dlen = await read_exact(reader, 4)
-    port, dlen = struct.unpack("!HH", port_dlen)
-    if dlen > 65535:
-        raise ValueError("bad udp frame payload length")
-    data = await read_exact(reader, dlen) if dlen else b""
-    wire_len = 4 + nlen + 4 + len(data)
-    return host, port, data, wire_len
-
-
-def pack_udp_frame(host: str, port: int, data: bytes) -> bytes:
-    hb = host.encode("utf-8")
-    if len(hb) > 1024:
-        raise ValueError("host too long")
-    if len(data) > 65535:
-        raise ValueError("datagram too large")
-    return (
-        bytes([UDP_FRAME_VERSION, 0])
-        + len(hb).to_bytes(2, "big")
-        + hb
-        + struct.pack("!HH", port, len(data))
-        + data
-    )
+# UDP_FRAME_VERSION, pack_udp_frame, read_exact, read_udp_frame
+# are imported from vpn_proxy_frame.py (shared with client.py)
 
 
 class UdpRelayProtocol(asyncio.DatagramProtocol):
@@ -312,7 +310,7 @@ async def pipe_tls_to_udp(
 ) -> None:
     try:
         while True:
-            host, port, data, wire_len = await read_udp_frame_from_tls(reader)
+            host, port, data, wire_len = await read_udp_frame(reader)
             if fixed_host is not None:
                 host, port = fixed_host, fixed_port  # type: ignore[assignment]
             transport.sendto(data, (host, port))
@@ -363,6 +361,16 @@ async def handle_client(
     stats = SessionStats()
     target_writer: Optional[asyncio.StreamWriter] = None
     _set_socket_options(writer, enable_keepalive=True)
+
+    if not _conn_limiter.allow():
+        LOG.warning("[sid=%s] rate limit exceeded from %s", session_id, peer)
+        try:
+            writer.write(b"ERR rate limit\n")
+            await writer.drain()
+        except (ConnectionError, OSError, RuntimeError):
+            pass
+        return
+
     try:
         if not peer_allowed(peer, allow_networks):
             raise PermissionError("peer not in allow-cidrs")

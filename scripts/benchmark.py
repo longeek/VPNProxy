@@ -106,13 +106,14 @@ def generate_cert(cert_dir: str, algo: str) -> None:
 
 
 def _make_py_proxy_handler(token: str, connect_timeout: float = 5.0,
-                            bootstrap_timeout: float = 30.0):
+                           bootstrap_timeout: float = 30.0):
     """Factory: returns a real `async def` callback for asyncio.start_server.
 
     Must NOT use functools.partial or lambdas on Windows ProactorEventLoop
     because they are not recognized as coroutine functions.
     """
     import server as _svr
+
     async def _handler(reader: asyncio.StreamReader,
                        writer: asyncio.StreamWriter):
         await _svr.handle_client(
@@ -126,7 +127,7 @@ def _make_py_proxy_handler(token: str, connect_timeout: float = 5.0,
 
 
 async def _echo_handler(reader: asyncio.StreamReader,
-                         writer: asyncio.StreamWriter):
+                        writer: asyncio.StreamWriter):
     try:
         while True:
             data = await reader.read(65536)
@@ -720,9 +721,14 @@ async def main():
             throughput = await bench_throughput(size_mb)
             default_tp = throughput["default_buf"]["throughput_mbps"]
             large_tp = throughput["large_buf"]["throughput_mbps"]
-            print(f"\n  ── Socket Buffer Throughput ({size_mb}MB transfer) ──", flush=True)
-            print(f"    Default buffers:  {fmt_throughput(default_tp)} ({throughput['default_buf']['elapsed_s']:.3f}s)", flush=True)
-            print(f"    Large buffers:    {fmt_throughput(large_tp)} ({throughput['large_buf']['elapsed_s']:.3f}s)", flush=True)
+            title = f"\n  ── Socket Buffer Throughput ({size_mb}MB transfer) ──"
+            print(title, flush=True)
+            def_buf = throughput['default_buf']
+            print(f"    Default buffers:  {fmt_throughput(default_tp)}"
+                  f" ({def_buf['elapsed_s']:.3f}s)", flush=True)
+            lrg_buf = throughput['large_buf']
+            print(f"    Large buffers:    {fmt_throughput(large_tp)}"
+                  f" ({lrg_buf['elapsed_s']:.3f}s)", flush=True)
             if default_tp > 0:
                 print(f"    Large buffer speedup: {large_tp / default_tp:.2f}x", flush=True)
             RESULTS["throughput_default"] = default_tp
