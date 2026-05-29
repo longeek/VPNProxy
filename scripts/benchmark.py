@@ -32,6 +32,7 @@ import uuid
 RESULTS: dict = {}
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GO_SERVER_BIN = os.path.join(PROJECT_ROOT, "vpn-proxy-go", "bin", "vpn-proxy-server.exe")
+RUST_SERVER_BIN = os.path.join(PROJECT_ROOT, "vpn-proxy-rust", "target", "release", "vpn-proxy-server.exe")
 
 
 def log(msg: str) -> None:
@@ -177,6 +178,43 @@ async def stop_go_server(proc: asyncio.subprocess.Process) -> None:
         proc.kill()
         await proc.wait()
     log("Go server stopped")
+
+
+# ── Rust server subprocess management ─────────────────────────────────────
+
+async def start_rust_server(cert_dir: str, port: int, token: str,
+                            rust_bin: str = RUST_SERVER_BIN) -> asyncio.subprocess.Process:
+    """Start Rust server as subprocess, return process handle."""
+    log(f"starting Rust server on 127.0.0.1:{port} ...")
+    proc = await asyncio.create_subprocess_exec(
+        rust_bin,
+        "--listen=127.0.0.1",
+        f"--port={port}",
+        f"--cert={os.path.join(cert_dir, 'server.crt')}",
+        f"--key={os.path.join(cert_dir, 'server.key')}",
+        f"--token={token}",
+        "--rate-limit=1000",
+        "--rate-burst=100",
+        "--max-conns=0",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await asyncio.sleep(0.8)  # wait for TLS listener
+    log("Rust server started")
+    return proc
+
+
+async def stop_rust_server(proc: asyncio.subprocess.Process) -> None:
+    """Gracefully stop the Rust server subprocess."""
+    log("stopping Rust server ...")
+    proc.terminate()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        log("Rust server didn't stop in 5s, killing ...")
+        proc.kill()
+        await proc.wait()
+    log("Rust server stopped")
 
 
 def find_free_port() -> int:
@@ -553,6 +591,76 @@ async def bench_go_proxy(cert_dir: str, iterations: int,
     return results
 
 
+# ── Test 4c: Rust proxy tunnel setup ───────────────────────────────────────
+
+async def bench_rust_proxy(cert_dir: str, iterations: int,
+                           rust_bin: str = RUST_SERVER_BIN) -> dict:
+    """End-to-end proxy tunnel setup using Rust server + Python client."""
+    sys.path.insert(0, PROJECT_ROOT)
+    import client as cli
+
+    token = "bench-token-" + uuid.uuid4().hex[:8]
+    rust_port = find_free_port()
+
+    rust_proc = await start_rust_server(cert_dir, rust_port, token, rust_bin)
+
+    results: dict = {"tunnel_setup_ms": []}
+
+    target_server = await asyncio.start_server(
+        _echo_handler, host="127.0.0.1", port=0
+    )
+    target_port = target_server.sockets[0].getsockname()[1]
+    log(f"Echo target on 127.0.0.1:{target_port}")
+
+    args = argparse.Namespace(
+        server="127.0.0.1",
+        server_port=rust_port,
+        token=token,
+        ca_cert=None,
+        insecure=True,
+        sni=None,
+        connect_retries=0,
+        retry_delay=0.01,
+        pool_size=0,
+        pool_ttl=8.0,
+    )
+
+    log(f"Rust proxy benchmark: {iterations} iterations ...")
+    # Warmup: first connection (cold TLS handshake, excluded from results)
+    try:
+        wr, ww = await cli.open_tunnel(
+            "127.0.0.1", target_port, args, "bench-rust-warmup"
+        )
+        ww.close()
+        await ww.wait_closed()
+    except Exception:
+        pass
+
+    for i in range(iterations):
+        t0 = time.perf_counter()
+        try:
+            tunnel_reader, tunnel_writer = await cli.open_tunnel(
+                "127.0.0.1", target_port, args, "bench-rust"
+            )
+        except Exception as e:
+            log(f"  iter {i+1} FAILED: {e}")
+            continue
+        t1 = time.perf_counter()
+        ms = (t1 - t0) * 1000
+        results["tunnel_setup_ms"].append(ms)
+
+        tunnel_writer.close()
+        await tunnel_writer.wait_closed()
+        if (i + 1) % 5 == 0:
+            log(f"  Rust: {i+1}/{iterations} done (mean={statistics.mean(results['tunnel_setup_ms']):.1f}ms)")
+
+    target_server.close()
+    await target_server.wait_closed()
+    await stop_rust_server(rust_proc)
+    log(f"Rust proxy benchmark done, {len(results['tunnel_setup_ms'])}/{iterations} succeeded")
+    return results
+
+
 # ── Test 6: Python connection pool ────────────────────────────────────────
 
 async def bench_py_pool(cert_dir: str, iterations: int) -> dict:
@@ -666,6 +774,9 @@ async def main():
     parser.add_argument("--go-bin", type=str, default=GO_SERVER_BIN,
                         help="path to Go server binary")
     parser.add_argument("--skip-go", action="store_true", help="skip Go benchmarks")
+    parser.add_argument("--rust-bin", type=str, default=RUST_SERVER_BIN,
+                        help="path to Rust server binary")
+    parser.add_argument("--skip-rust", action="store_true", help="skip Rust benchmarks")
     parser.add_argument("--skip-throughput", action="store_true",
                         help="skip socket throughput test (flaky on Windows)")
     args = parser.parse_args()
@@ -771,6 +882,21 @@ async def main():
             bin_msg = "binary not found" if not os.path.isfile(args.go_bin) else "skipped"
             log(f"TEST [4b/5] Go Proxy — SKIPPED ({bin_msg})")
 
+        # 4c. Rust proxy
+        rust_setup = None
+        if not args.skip_rust and os.path.isfile(args.rust_bin):
+            log("=" * 60)
+            log("TEST [4c/5] Rust Proxy — tunnel setup")
+            log("=" * 60)
+            rust_proxy = await bench_rust_proxy(cert_dir, iters, args.rust_bin)
+            rust_setup = rust_proxy["tunnel_setup_ms"]
+            print(f"\n  ── Rust Server + Python Client ──", flush=True)
+            print(f"    Tunnel setup: {fmt_stats(rust_setup)}", flush=True)
+            RESULTS["rust_tunnel_setup"] = statistics.mean(rust_setup) if rust_setup else None
+        else:
+            bin_msg = "binary not found" if not os.path.isfile(args.rust_bin) else "skipped"
+            log(f"TEST [4c/5] Rust Proxy — SKIPPED ({bin_msg})")
+
     # ── Pool test in separate temp dir ───────────────────────────────────
     if not args.skip_pool:
         log("=" * 60)
@@ -797,8 +923,8 @@ async def main():
     print("  SUMMARY — Cross-Language Performance Comparison", flush=True)
     print("=" * 72, flush=True)
 
-    headers = ["Metric", "Python", "Go", "Winner"]
-    col_w = [30, 18, 18, 10]
+    headers = ["Metric", "Python", "Go", "Rust", "Winner"]
+    col_w = [30, 18, 18, 18, 10]
 
     def print_row(cols):
         parts = "".join(c.ljust(w) for c, w in zip(cols, col_w))
@@ -810,24 +936,41 @@ async def main():
 
     py_tunnel = RESULTS.get("py_tunnel_setup")
     go_tunnel = RESULTS.get("go_tunnel_setup")
+    rust_tunnel = RESULTS.get("rust_tunnel_setup")
     py_tun_str = f"{py_tunnel:.1f}ms" if py_tunnel else "N/A"
     go_tun_str = f"{go_tunnel:.1f}ms" if go_tunnel else "N/A"
-    winner = "Go" if (go_tunnel and py_tunnel and go_tunnel < py_tunnel) else "Python" if py_tunnel else "—"
-    print_row(["Tunnel Setup (mean)", py_tun_str, go_tun_str, winner])
+    rust_tun_str = f"{rust_tunnel:.1f}ms" if rust_tunnel else "N/A"
+    candidates = {}
+    if py_tunnel: candidates["Python"] = py_tunnel
+    if go_tunnel: candidates["Go"] = go_tunnel
+    if rust_tunnel: candidates["Rust"] = rust_tunnel
+    winner = min(candidates, key=candidates.get) if candidates else "—"
+    print_row(["Tunnel Setup (mean)", py_tun_str, go_tun_str, rust_tun_str, winner])
 
     py_pool_v = RESULTS.get("py_pool_setup")
     pool_spd = RESULTS.get("pool_speedup")
     py_pool_str = f"{py_pool_v:.1f}ms" if py_pool_v else "N/A"
     pool_str = f"{pool_spd:.1f}x" if pool_spd else "N/A"
-    print_row(["Pool Setup (mean)", py_pool_str, "N/A", "—"])
+    print_row(["Pool Setup (mean)", py_pool_str, "N/A", "N/A", "—"])
 
     print_row(["Throughput (large buf)",
                f"{RESULTS.get('throughput_large', 0):.1f} MB/s",
-               "N/A", "—"])
+               "N/A", "N/A", "—"])
 
     print("  " + "-" * (sum(col_w)), flush=True)
 
-    if py_tunnel and go_tunnel and py_tunnel > 0:
+    if py_tunnel and go_tunnel and rust_tunnel and py_tunnel > 0:
+        # Lower is better. ratio = py / go: >1 means Go/Rust wins (lower latency)
+        go_vs_py = py_tunnel / go_tunnel
+        rust_vs_py = py_tunnel / rust_tunnel
+        rust_vs_go = go_tunnel / rust_tunnel
+        print(f"\n  >> Go server is {go_vs_py:.2f}x faster than Python in tunnel setup", flush=True)
+        print(f"  >> Rust server is {rust_vs_py:.2f}x faster than Python in tunnel setup", flush=True)
+        print(f"  >> Rust server is {rust_vs_go:.2f}x faster than Go in tunnel setup", flush=True)
+        RESULTS["go_vs_py_speedup"] = go_vs_py
+        RESULTS["rust_vs_py_speedup"] = rust_vs_py
+        RESULTS["rust_vs_go_speedup"] = rust_vs_go
+    elif py_tunnel and go_tunnel and py_tunnel > 0:
         # Lower is better. ratio = py / go: >1 means Go wins (lower latency)
         ratio = py_tunnel / go_tunnel
         if ratio > 1:
@@ -835,8 +978,23 @@ async def main():
         else:
             print(f"\n  >> Python server is {1/ratio:.2f}x faster than Go in tunnel setup", flush=True)
         RESULTS["go_vs_py_speedup"] = ratio
-    elif not go_tunnel:
-        print("\n  >> Go binary not available — comparison limited to Python only", flush=True)
+    elif py_tunnel and rust_tunnel and py_tunnel > 0:
+        # Lower is better. ratio = py / go: >1 means Rust wins (lower latency)
+        ratio = py_tunnel / rust_tunnel
+        if ratio > 1:
+            print(f"\n  >> Rust server is {ratio:.2f}x faster than Python in tunnel setup", flush=True)
+        else:
+            print(f"\n  >> Python server is {1/ratio:.2f}x faster than Rust in tunnel setup", flush=True)
+        RESULTS["rust_vs_py_speedup"] = ratio
+    else:
+        not_avail = []
+        if not go_tunnel:
+            not_avail.append("Go")
+        if not rust_tunnel:
+            not_avail.append("Rust")
+        avail = ' and '.join(not_avail)
+        plural = len(not_avail) > 1
+        print(f"\n  >> {avail} {'binaries' if plural else 'binary'} not available — comparison limited", flush=True)
 
     print("\n" + "=" * 72, flush=True)
     print("  Benchmark complete.", flush=True)

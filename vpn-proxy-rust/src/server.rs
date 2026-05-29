@@ -16,16 +16,16 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter, copy_buf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tracing::{debug, info, warn, Level};
+use tokio::sync::Semaphore;
+use tracing::{Level, debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use vpn_proxy::dns_cache::DnsCache;
 use vpn_proxy::server_logic::{
-    load_allowed_tokens, next_session_id, pack_udp_frame, parse_allow_cidrs,
-    parse_bootstrap_line, peer_allowed, BootstrapInfo,
-    DRAIN_THRESHOLD, PIPE_BUF_SIZE, RECV_BUF_SIZE, UDP_FRAME_VERSION,
+    BootstrapInfo, RECV_BUF_SIZE, UDP_FRAME_VERSION, load_allowed_tokens, next_session_id,
+    pack_udp_frame, parse_allow_cidrs, parse_bootstrap_line, peer_allowed,
 };
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -51,7 +51,9 @@ impl RateLimiter {
 
     fn allow(&mut self) -> bool {
         let now = Instant::now();
-        let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
         if elapsed > 0.0 {
             self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.max_tokens);
             self.last_refill = now;
@@ -96,7 +98,8 @@ async fn cached_lookup_host(host: &str) -> Option<IpAddr> {
     match addrs {
         Ok(mut addrs) => {
             // Prefer IPv4, fallback to any
-            let ip = addrs.find(|a| a.is_ipv4())
+            let ip = addrs
+                .find(|a| a.is_ipv4())
                 .or_else(|| addrs.next())
                 .map(|a| a.ip());
             DNS_CACHE.store(host.to_string(), ip);
@@ -139,6 +142,8 @@ struct Cli {
     rate_limit: f64,
     #[arg(long, default_value_t = 20)]
     rate_burst: u32,
+    #[arg(long, default_value_t = 0)]
+    max_conns: usize,
 }
 
 fn load_tokens_cli(cli: &Cli) -> Vec<String> {
@@ -165,7 +170,11 @@ struct BootstrapInfo_ {
 
 impl From<BootstrapInfo> for BootstrapInfo_ {
     fn from(b: BootstrapInfo) -> Self {
-        BootstrapInfo_ { host: b.host, port: b.port, proto: b.proto }
+        BootstrapInfo_ {
+            host: b.host,
+            port: b.port,
+            proto: b.proto,
+        }
     }
 }
 
@@ -202,7 +211,10 @@ struct UdpFrameHeader {
 
 async fn read_udp_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<UdpFrameHeader, String> {
     let mut hdr = [0u8; 4];
-    reader.read_exact(&mut hdr).await.map_err(|e| format!("read hdr: {e}"))?;
+    reader
+        .read_exact(&mut hdr)
+        .await
+        .map_err(|e| format!("read hdr: {e}"))?;
     if hdr[0] != UDP_FRAME_VERSION {
         return Err("bad udp frame version".to_string());
     }
@@ -211,10 +223,16 @@ async fn read_udp_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<UdpFr
         return Err("bad udp frame host length".to_string());
     }
     let mut host_buf = vec![0u8; nlen];
-    reader.read_exact(&mut host_buf).await.map_err(|e| format!("read host: {e}"))?;
+    reader
+        .read_exact(&mut host_buf)
+        .await
+        .map_err(|e| format!("read host: {e}"))?;
     let host = String::from_utf8_lossy(&host_buf).to_string();
     let mut port_dlen = [0u8; 4];
-    reader.read_exact(&mut port_dlen).await.map_err(|e| format!("read port_dlen: {e}"))?;
+    reader
+        .read_exact(&mut port_dlen)
+        .await
+        .map_err(|e| format!("read port_dlen: {e}"))?;
     let port = u16::from_be_bytes([port_dlen[0], port_dlen[1]]);
     let dlen = u16::from_be_bytes([port_dlen[2], port_dlen[3]]) as usize;
     if dlen > 65535 {
@@ -222,10 +240,18 @@ async fn read_udp_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<UdpFr
     }
     let mut data = vec![0u8; dlen];
     if dlen > 0 {
-        reader.read_exact(&mut data).await.map_err(|e| format!("read data: {e}"))?;
+        reader
+            .read_exact(&mut data)
+            .await
+            .map_err(|e| format!("read data: {e}"))?;
     }
     let wire_len = 4 + nlen + 4 + data.len();
-    Ok(UdpFrameHeader { host, port, data, wire_len })
+    Ok(UdpFrameHeader {
+        host,
+        port,
+        data,
+        wire_len,
+    })
 }
 
 async fn run_udp_relay(
@@ -289,7 +315,9 @@ async fn run_udp_relay(
             if let Err(e) = udp1.send_to(&frame.data, addr).await {
                 debug!("[sid={sid1}] UDP sendto failed: {e}");
             }
-            stats1.upload_bytes.fetch_add(frame.wire_len as u64, Ordering::Relaxed);
+            stats1
+                .upload_bytes
+                .fetch_add(frame.wire_len as u64, Ordering::Relaxed);
         }
     });
 
@@ -313,7 +341,9 @@ async fn run_udp_relay(
                         debug!("[sid={sid2}] UDP flush error: {e}");
                         break;
                     }
-                    stats2.download_bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                    stats2
+                        .download_bytes
+                        .fetch_add(frame.len() as u64, Ordering::Relaxed);
                 }
                 Err(e) => {
                     debug!("[sid={sid2}] UDP recv error: {e}");
@@ -328,9 +358,7 @@ async fn run_udp_relay(
 
     let up = stats.upload_bytes.load(Ordering::Relaxed);
     let down = stats.download_bytes.load(Ordering::Relaxed);
-    info!(
-        "[sid={session_id}] UDP session closed (up={up} bytes, down={down} bytes)"
-    );
+    info!("[sid={session_id}] UDP session closed (up={up} bytes, down={down} bytes)");
 }
 
 async fn handle_tcp_relay(
@@ -343,7 +371,8 @@ async fn handle_tcp_relay(
     port: u16,
 ) {
     let t0 = std::time::Instant::now();
-    let target = match tokio::time::timeout(connect_timeout, TcpStream::connect(target_addr)).await {
+    let target = match tokio::time::timeout(connect_timeout, TcpStream::connect(target_addr)).await
+    {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             warn!("[sid={session_id}] backend connect failed to {target_addr}: {e}");
@@ -359,7 +388,8 @@ async fn handle_tcp_relay(
     debug!(
         "[sid={session_id}] backend connect timing: {:.0}ms to {}:{} (timeout={:.1}s)",
         (t1 - t0).as_secs_f64() * 1000.0,
-        host, port,
+        host,
+        port,
         connect_timeout.as_secs_f64(),
     );
 
@@ -373,91 +403,41 @@ async fn handle_tcp_relay(
     let sid_down = session_id.clone();
 
     let up = tokio::spawn(async move {
-        let mut tls_r = tokio::io::BufReader::with_capacity(PIPE_BUF_SIZE, tls_r);
-        let mut target_w = tokio::io::BufWriter::with_capacity(PIPE_BUF_SIZE, target_w);
-        let mut buf = vec![0u8; PIPE_BUF_SIZE];
-        let mut pending = 0usize;
-        let mut acc = 0u64;
-        loop {
-            let n = match tls_r.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) => {
-                    if e.kind() != std::io::ErrorKind::ConnectionReset
-                        && e.kind() != std::io::ErrorKind::BrokenPipe
-                        && e.kind() != std::io::ErrorKind::UnexpectedEof
-                    {
-                        debug!("[sid={sid_up}] tls read: {e}");
-                    }
-                    break;
-                }
-            };
-            if let Err(e) = target_w.write_all(&buf[..n]).await {
-                if e.kind() != std::io::ErrorKind::BrokenPipe {
-                    debug!("[sid={sid_up}] target write: {e}");
-                }
-                break;
+        let mut buf_reader = BufReader::with_capacity(32 * 1024, tls_r);
+        let mut buf_writer = BufWriter::with_capacity(32 * 1024, target_w);
+        match copy_buf(&mut buf_reader, &mut buf_writer).await {
+            Ok(n) => {
+                let _ = buf_writer.flush().await;
+                stats_up.upload_bytes.fetch_add(n, Ordering::Relaxed);
             }
-            pending += n;
-            acc += n as u64;
-            if pending >= DRAIN_THRESHOLD {
-                if let Err(e) = target_w.flush().await {
-                    if e.kind() != std::io::ErrorKind::BrokenPipe {
-                        debug!("[sid={sid_up}] target flush: {e}");
-                    }
-                    break;
+            Err(e) => {
+                let _ = buf_writer.flush().await;
+                if e.kind() != std::io::ErrorKind::ConnectionReset
+                    && e.kind() != std::io::ErrorKind::BrokenPipe
+                    && e.kind() != std::io::ErrorKind::UnexpectedEof
+                {
+                    debug!("[sid={sid_up}] relay error: {e}");
                 }
-                pending = 0;
-                stats_up.upload_bytes.fetch_add(acc, Ordering::Relaxed);
-                acc = 0;
             }
-        }
-        if acc > 0 {
-            stats_up.upload_bytes.fetch_add(acc, Ordering::Relaxed);
         }
     });
 
     let down = tokio::spawn(async move {
-        let mut target_r = tokio::io::BufReader::with_capacity(PIPE_BUF_SIZE, target_r);
-        let mut tls_w = tokio::io::BufWriter::with_capacity(PIPE_BUF_SIZE, tls_w);
-        let mut buf = vec![0u8; PIPE_BUF_SIZE];
-        let mut pending = 0usize;
-        let mut acc = 0u64;
-        loop {
-            let n = match target_r.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) => {
-                    if e.kind() != std::io::ErrorKind::ConnectionReset
-                        && e.kind() != std::io::ErrorKind::BrokenPipe
-                    {
-                        debug!("[sid={sid_down}] target read: {e}");
-                    }
-                    break;
-                }
-            };
-            if let Err(e) = tls_w.write_all(&buf[..n]).await {
-                if e.kind() != std::io::ErrorKind::BrokenPipe {
-                    debug!("[sid={sid_down}] tls write: {e}");
-                }
-                break;
+        let mut buf_reader = BufReader::with_capacity(32 * 1024, target_r);
+        let mut buf_writer = BufWriter::with_capacity(32 * 1024, tls_w);
+        match copy_buf(&mut buf_reader, &mut buf_writer).await {
+            Ok(n) => {
+                let _ = buf_writer.flush().await;
+                stats_down.download_bytes.fetch_add(n, Ordering::Relaxed);
             }
-            pending += n;
-            acc += n as u64;
-            if pending >= DRAIN_THRESHOLD {
-                if let Err(e) = tls_w.flush().await {
-                    if e.kind() != std::io::ErrorKind::BrokenPipe {
-                        debug!("[sid={sid_down}] tls flush: {e}");
-                    }
-                    break;
+            Err(e) => {
+                let _ = buf_writer.flush().await;
+                if e.kind() != std::io::ErrorKind::ConnectionReset
+                    && e.kind() != std::io::ErrorKind::BrokenPipe
+                {
+                    debug!("[sid={sid_down}] relay error: {e}");
                 }
-                pending = 0;
-                stats_down.download_bytes.fetch_add(acc, Ordering::Relaxed);
-                acc = 0;
             }
-        }
-        if acc > 0 {
-            stats_down.download_bytes.fetch_add(acc, Ordering::Relaxed);
         }
     });
 
@@ -467,9 +447,7 @@ async fn handle_tcp_relay(
 
     let up_bytes = stats_final.upload_bytes.load(Ordering::Relaxed);
     let down_bytes = stats_final.download_bytes.load(Ordering::Relaxed);
-    info!(
-        "[sid={session_id}] session closed (up={up_bytes} bytes, down={down_bytes} bytes)"
-    );
+    info!("[sid={session_id}] session closed (up={up_bytes} bytes, down={down_bytes} bytes)");
 }
 
 /// Shared application context passed to each connection handler.
@@ -490,7 +468,10 @@ async fn handle_client(tls_stream: TlsStream, ctx: Arc<AppContext>) {
     // NOTE: MutexGuard must be DROPPED before any .await to satisfy Send bound in tokio::spawn
     let rate_allowed = CONN_LIMITER.lock().unwrap().allow();
     if !rate_allowed {
-        warn!("[sid={session_id}] connection rate limit exceeded from {:?}", peer);
+        warn!(
+            "[sid={session_id}] connection rate limit exceeded from {:?}",
+            peer
+        );
         let (_r, mut w) = tokio::io::split(tls_stream);
         let _ = w.write_all(b"ERR rate limit\n").await;
         let _ = w.flush().await;
@@ -528,7 +509,8 @@ async fn handle_client(tls_stream: TlsStream, ctx: Arc<AppContext>) {
                 Err(e) => break Err(format!("read error: {e}")),
             }
         }
-    }).await;
+    })
+    .await;
 
     let n = match read_result {
         Ok(Ok(n)) => n,
@@ -572,7 +554,10 @@ async fn handle_client(tls_stream: TlsStream, ctx: Arc<AppContext>) {
         let ip = match cached_lookup_host(&info.host).await {
             Some(ip) => ip,
             None => {
-                warn!("[sid={session_id}] DNS lookup failed for {}:{}", info.host, info.port);
+                warn!(
+                    "[sid={session_id}] DNS lookup failed for {}:{}",
+                    info.host, info.port
+                );
                 return;
             }
         };
@@ -581,7 +566,16 @@ async fn handle_client(tls_stream: TlsStream, ctx: Arc<AppContext>) {
         let _ = tls.write_all(b"OK\n").await;
         let _ = tls.flush().await;
 
-        handle_tcp_relay(tls, addr, stats, session_id, ctx.connect_timeout, info.host, info.port).await;
+        handle_tcp_relay(
+            tls,
+            addr,
+            stats,
+            session_id,
+            ctx.connect_timeout,
+            info.host,
+            info.port,
+        )
+        .await;
     }
 }
 
@@ -604,8 +598,14 @@ async fn main() {
         .install_default()
         .expect("failed to install rustls crypto provider");
 
-    let cert_path = cli.cert.clone().unwrap_or_else(|| "./certs/server.crt".to_string());
-    let key_path = cli.key.clone().unwrap_or_else(|| "./certs/server.key".to_string());
+    let cert_path = cli
+        .cert
+        .clone()
+        .unwrap_or_else(|| "./certs/server.crt".to_string());
+    let key_path = cli
+        .key
+        .clone()
+        .unwrap_or_else(|| "./certs/server.key".to_string());
     let allowed_tokens = Arc::new(load_tokens_cli(&cli));
     let allow_networks = parse_allow_cidrs(&cli.allow_cidrs);
     let connect_timeout = Duration::from_secs_f64(cli.connect_timeout);
@@ -618,12 +618,26 @@ async fn main() {
     }
 
     if !allow_networks.is_empty() {
-        info!("allow-cidrs enabled with {} network(s)", allow_networks.len());
+        info!(
+            "allow-cidrs enabled with {} network(s)",
+            allow_networks.len()
+        );
     }
 
     // Initialize rate limiter from CLI args
     init_rate_limiter(cli.rate_limit, cli.rate_burst);
-    info!("rate limit: {} req/s, burst={}", cli.rate_limit, cli.rate_burst);
+    info!(
+        "rate limit: {} req/s, burst={}",
+        cli.rate_limit, cli.rate_burst
+    );
+
+    // Semaphore-based concurrency limiter (0 = unlimited, backward compatible)
+    let semaphore: Option<Arc<Semaphore>> = if cli.max_conns > 0 {
+        info!("max concurrent connections set to {}", cli.max_conns);
+        Some(Arc::new(Semaphore::new(cli.max_conns)))
+    } else {
+        None
+    };
 
     let ctx = Arc::new(AppContext {
         allowed_tokens,
@@ -632,14 +646,32 @@ async fn main() {
         bootstrap_timeout,
     });
 
-    let certs: Vec<rustls::pki_types::CertificateDer<'_>> = rustls_pemfile::certs(&mut std::io::BufReader::new(
-        std::fs::File::open(&cert_path).unwrap_or_else(|e| { eprintln!("cannot open cert file {cert_path}: {e}"); std::process::exit(1) })
-    )).collect::<Result<Vec<_>, _>>().unwrap_or_else(|e| { eprintln!("cannot parse cert file: {e}"); std::process::exit(1) });
+    let certs: Vec<rustls::pki_types::CertificateDer<'_>> = rustls_pemfile::certs(
+        &mut std::io::BufReader::new(std::fs::File::open(&cert_path).unwrap_or_else(|e| {
+            eprintln!("cannot open cert file {cert_path}: {e}");
+            std::process::exit(1)
+        })),
+    )
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap_or_else(|e| {
+        eprintln!("cannot parse cert file: {e}");
+        std::process::exit(1)
+    });
 
     let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-        std::fs::File::open(&key_path).unwrap_or_else(|e| { eprintln!("cannot open key file {key_path}: {e}"); std::process::exit(1) })
-    )).unwrap_or_else(|e| { eprintln!("cannot parse key file: {e}"); std::process::exit(1) })
-      .unwrap_or_else(|| { eprintln!("no key found in key file"); std::process::exit(1) });
+        std::fs::File::open(&key_path).unwrap_or_else(|e| {
+            eprintln!("cannot open key file {key_path}: {e}");
+            std::process::exit(1)
+        }),
+    ))
+    .unwrap_or_else(|e| {
+        eprintln!("cannot parse key file: {e}");
+        std::process::exit(1)
+    })
+    .unwrap_or_else(|| {
+        eprintln!("no key found in key file");
+        std::process::exit(1)
+    });
 
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -656,10 +688,32 @@ async fn main() {
         set_socket_opts(&stream);
         debug!("new connection from {}", peer);
 
+        // Concurrency limiting: try to acquire semaphore permit (non-blocking).
+        // When limit is reached, new connections are rejected (not queued).
+        let permit: Option<tokio::sync::OwnedSemaphorePermit> = match &semaphore {
+            Some(sem) => match sem.clone().try_acquire_owned() {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    warn!(
+                        "connection limit ({}) reached, rejecting {peer}",
+                        cli.max_conns
+                    );
+                    // Send a rejection error before closing the raw TCP stream
+                    let _ = stream.writable().await;
+                    let _ = stream.try_write(b"ERR busy\n");
+                    continue;
+                }
+            },
+            None => None,
+        };
+
         let acceptor = acceptor.clone();
         let ctx = ctx.clone();
 
         tokio::spawn(async move {
+            // RAII: _permit is held for the lifetime of this task and
+            // auto-releases the semaphore slot when dropped.
+            let _permit = permit;
             match acceptor.accept(stream).await {
                 Ok(tls_stream) => {
                     handle_client(tls_stream, ctx).await;

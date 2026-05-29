@@ -1,3 +1,7 @@
+pub mod bufpool;
+
+pub mod pool;
+
 pub mod dns_cache {
     use std::collections::HashMap;
     use std::net::IpAddr;
@@ -35,10 +39,13 @@ pub mod dns_cache {
 
         pub fn store(&self, host: String, ip: Option<IpAddr>) {
             let mut cache = self.cache.lock().unwrap();
-            cache.insert(host, CacheEntry {
-                ip,
-                expires_at: Instant::now() + self.ttl,
-            });
+            cache.insert(
+                host,
+                CacheEntry {
+                    ip,
+                    expires_at: Instant::now() + self.ttl,
+                },
+            );
         }
     }
 }
@@ -64,14 +71,15 @@ pub mod server_logic {
             tokens.push(t.to_string());
         }
         if let Some(path) = tokens_file
-            && let Ok(content) = std::fs::read_to_string(path) {
-                for line in content.lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                        tokens.push(trimmed.to_string());
-                    }
+            && let Ok(content) = std::fs::read_to_string(path)
+        {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                    tokens.push(trimmed.to_string());
                 }
             }
+        }
         tokens
     }
 
@@ -110,7 +118,10 @@ pub mod server_logic {
         InvalidProto,
     }
 
-    pub fn parse_bootstrap_line(line: &str, allowed_tokens: &[String]) -> Result<BootstrapInfo, BootstrapError> {
+    pub fn parse_bootstrap_line(
+        line: &str,
+        allowed_tokens: &[String],
+    ) -> Result<BootstrapInfo, BootstrapError> {
         let payload: serde_json::Value = serde_json::from_str(line)?;
         let token = payload
             .get("auth")
@@ -278,19 +289,13 @@ pub mod server_logic {
 
         #[test]
         fn test_peer_allowed_empty_networks() {
-            assert!(peer_allowed(
-                IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
-                &[]
-            ));
+            assert!(peer_allowed(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), &[]));
         }
 
         #[test]
         fn test_peer_allowed_in_network() {
             let nets = parse_allow_cidrs("10.0.0.0/8");
-            assert!(peer_allowed(
-                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-                &nets
-            ));
+            assert!(peer_allowed(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), &nets));
         }
 
         #[test]
@@ -309,10 +314,7 @@ pub mod server_logic {
                 IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)),
                 &nets
             ));
-            assert!(peer_allowed(
-                IpAddr::V6(Ipv6Addr::LOCALHOST),
-                &nets
-            ));
+            assert!(peer_allowed(IpAddr::V6(Ipv6Addr::LOCALHOST), &nets));
             assert!(!peer_allowed(
                 IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
                 &nets
@@ -356,30 +358,21 @@ pub mod server_logic {
         #[test]
         fn test_parse_bootstrap_line_missing_auth() {
             let tokens = vec!["tok".to_string()];
-            let result = parse_bootstrap_line(
-                r#"{"host":"example.com","port":443}"#,
-                &tokens,
-            );
+            let result = parse_bootstrap_line(r#"{"host":"example.com","port":443}"#, &tokens);
             assert!(result.is_err());
         }
 
         #[test]
         fn test_parse_bootstrap_line_missing_host() {
             let tokens = vec!["tok".to_string()];
-            let result = parse_bootstrap_line(
-                r#"{"auth":"tok","port":443}"#,
-                &tokens,
-            );
+            let result = parse_bootstrap_line(r#"{"auth":"tok","port":443}"#, &tokens);
             assert!(result.is_err());
         }
 
         #[test]
         fn test_parse_bootstrap_line_missing_port() {
             let tokens = vec!["tok".to_string()];
-            let result = parse_bootstrap_line(
-                r#"{"auth":"tok","host":"example.com"}"#,
-                &tokens,
-            );
+            let result = parse_bootstrap_line(r#"{"auth":"tok","host":"example.com"}"#, &tokens);
             assert!(result.is_err());
         }
 
@@ -413,10 +406,7 @@ pub mod server_logic {
         #[test]
         fn test_parse_bootstrap_line_port_overflow() {
             let tokens = vec!["tok".to_string()];
-            let result = parse_bootstrap_line(
-                r#"{"auth":"tok","host":"x","port":70000}"#,
-                &tokens,
-            );
+            let result = parse_bootstrap_line(r#"{"auth":"tok","host":"x","port":70000}"#, &tokens);
             assert!(result.is_err());
         }
 
@@ -508,9 +498,7 @@ pub mod client_logic {
                 if packet.len() < 10 {
                     return Err("short ipv4".to_string());
                 }
-                let addr: [u8; 4] = packet[4..8]
-                    .try_into()
-                    .map_err(|_| "ipv4 parse")?;
+                let addr: [u8; 4] = packet[4..8].try_into().map_err(|_| "ipv4 parse")?;
                 (std::net::Ipv4Addr::from(addr).to_string(), 8)
             }
             0x03 => {
@@ -525,9 +513,7 @@ pub mod client_logic {
                 if packet.len() < 20 {
                     return Err("short ipv6".to_string());
                 }
-                let addr: [u8; 16] = packet[4..20]
-                    .try_into()
-                    .map_err(|_| "ipv6 parse")?;
+                let addr: [u8; 16] = packet[4..20].try_into().map_err(|_| "ipv6 parse")?;
                 (std::net::Ipv6Addr::from(addr).to_string(), 20)
             }
             _ => return Err("unsupported atyp".to_string()),
@@ -604,12 +590,13 @@ pub mod client_logic {
                     let b64 = value[6..].trim();
                     if let Ok(decoded) =
                         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
-                        && let Ok(ds) = String::from_utf8(decoded) {
-                            let parts: Vec<&str> = ds.splitn(2, ':').collect();
-                            if parts.len() == 2 && parts[0] == user && parts[1] == pass {
-                                return true;
-                            }
+                        && let Ok(ds) = String::from_utf8(decoded)
+                    {
+                        let parts: Vec<&str> = ds.splitn(2, ':').collect();
+                        if parts.len() == 2 && parts[0] == user && parts[1] == pass {
+                            return true;
                         }
+                    }
                 }
                 break;
             }
@@ -703,11 +690,7 @@ pub mod client_logic {
             return Err("buffer too short for payload".to_string());
         }
         let data = buf[off + 4..off + 4 + dlen].to_vec();
-        Ok(UdpFrame {
-            host,
-            port,
-            data,
-        })
+        Ok(UdpFrame { host, port, data })
     }
 
     #[derive(Debug, PartialEq)]
@@ -880,20 +863,16 @@ pub mod client_logic {
 
         #[test]
         fn test_check_http_basic_auth_valid() {
-            let creds = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                "user:pass",
-            );
+            let creds =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "user:pass");
             let header = format!("Proxy-Authorization: Basic {creds}\r\n").into_bytes();
             assert!(check_http_basic_auth(&header, "user", "pass"));
         }
 
         #[test]
         fn test_check_http_basic_auth_wrong_pass() {
-            let creds = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                "user:wrong",
-            );
+            let creds =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "user:wrong");
             let header = format!("Proxy-Authorization: Basic {creds}\r\n").into_bytes();
             assert!(!check_http_basic_auth(&header, "user", "pass"));
         }
