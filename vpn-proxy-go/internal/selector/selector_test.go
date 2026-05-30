@@ -20,6 +20,20 @@ import (
 // delay, writes the response (typically "OK\n"), reads an HTTP request,
 // then writes one response byte.
 func benchmarkPipeConn(delay time.Duration, response string) net.Conn {
+	return benchmarkPipeConnWithData(delay, response, "H")
+}
+
+// benchmarkPipeConnWithData is like benchmarkPipeConn but writes extraData
+// after the first byte, for bandwidth measurement tests. Writes up to
+// maxBytes of data in 64KB chunks, sleeping chunkDelay between each.
+func benchmarkPipeConnWithData(delay time.Duration, response, extraData string) net.Conn {
+	return benchmarkPipeConnChunked(delay, response, extraData, 0, 0)
+}
+
+// benchmarkPipeConnChunked writes response + up to maxBytes of repeated
+// payload data in chunkSize-byte chunks, with chunkDelay between each.
+// Used to simulate a target that serves a large response.
+func benchmarkPipeConnChunked(delay time.Duration, response, chunkPayload string, maxBytes int, chunkDelay time.Duration) net.Conn {
 	client, server := net.Pipe()
 	go func() {
 		defer server.Close()
@@ -48,6 +62,22 @@ func benchmarkPipeConn(delay time.Duration, response string) net.Conn {
 
 		// Write first byte of response data
 		server.Write([]byte("H"))
+
+		// Write additional data for bandwidth measurement
+		remaining := maxBytes
+		for remaining > 0 {
+			writeSize := len(chunkPayload)
+			if writeSize > remaining {
+				writeSize = remaining
+			}
+			if _, err := server.Write([]byte(chunkPayload[:writeSize])); err != nil {
+				return
+			}
+			remaining -= writeSize
+			if chunkDelay > 0 {
+				time.Sleep(chunkDelay)
+			}
+		}
 	}()
 	return client
 }
@@ -153,7 +183,7 @@ func TestSelectByBenchmark_oneSucceeds(t *testing.T) {
 	// Port 1 fails, port 2 succeeds
 	dialTunnelFn = mockDialFn(
 		mockEntry{port: 1, conn: failDialConn()},
-		mockEntry{port: 2, conn: benchmarkPipeConn(20*time.Millisecond, "OK\n")},
+		mockEntry{port: 2, conn: bandwidthPipeConn(15*time.Millisecond, 500*1024, 0)},
 	)
 
 	servers := []Server{
@@ -315,5 +345,168 @@ func TestSelectFastest_allFail(t *testing.T) {
 	_, _, err := SelectFastest(context.Background(), servers)
 	if err == nil {
 		t.Fatal("expected error when all servers unreachable")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SelectByBandwidth
+// ---------------------------------------------------------------------------
+
+// bandwidthPipeConn returns a pipe that writes up to maxBytes of data after
+// the first response byte, then closes. When chunkDelay > 0, each 64KB chunk
+// is followed by chunkDelay to simulate a slower connection.
+func bandwidthPipeConn(latency time.Duration, maxBytes int, chunkDelay time.Duration) net.Conn {
+	client, server := net.Pipe()
+	go func() {
+		defer server.Close()
+		buf := make([]byte, 4096)
+
+		n, err := server.Read(buf)
+		if err != nil {
+			return
+		}
+		if err := json.Unmarshal(buf[:n], &tunnel.BootstrapInfo{}); err != nil {
+			return
+		}
+
+		time.Sleep(latency)
+		server.Write([]byte("OK\n"))
+
+		if _, err := server.Read(buf); err != nil {
+			return
+		}
+
+		// Write first byte
+		server.Write([]byte("H"))
+
+		// Write remaining data in 64KB chunks with optional delay
+		chunk := make([]byte, 65536)
+		for i := range chunk {
+			chunk[i] = 'x'
+		}
+		written := 0
+		for written < maxBytes {
+			n := len(chunk)
+			if written+n > maxBytes {
+				n = maxBytes - written
+			}
+			if _, err := server.Write(chunk[:n]); err != nil {
+				return
+			}
+			written += n
+			if chunkDelay > 0 {
+				time.Sleep(chunkDelay)
+			}
+		}
+	}()
+	return client
+}
+
+func TestSelectByBandwidth_choosesHigherBandwidth(t *testing.T) {
+	orig := dialTunnelFn
+	defer func() { dialTunnelFn = orig }()
+
+	// Port 1: 80ms latency, 200KB with 40ms/64KB chunk delay → ~1250 KB/s
+	// Port 2: 100ms latency, 800KB with 5ms/64KB chunk delay → ~12308 KB/s
+	//
+	// Bandwidth scoring should prefer port 2 despite its higher latency:
+	//   port1 score ≈ 80 + 102400/1250 ≈ 162
+	//   port2 score ≈ 100 + 102400/12308 ≈ 108
+	dialTunnelFn = mockDialFn(
+		mockEntry{port: 1, conn: bandwidthPipeConn(80*time.Millisecond, 200*1024, 40*time.Millisecond)},
+		mockEntry{port: 2, conn: bandwidthPipeConn(100*time.Millisecond, 800*1024, 5*time.Millisecond)},
+	)
+
+	servers := []Server{
+		{Host: "low-bw.test", Port: 1},
+		{Host: "high-bw.test", Port: 2},
+	}
+
+	best, latency, bw, err := SelectByBandwidth(context.Background(), servers, "token", true)
+	if err != nil {
+		t.Fatalf("SelectByBandwidth failed: %v", err)
+	}
+	if best.Port != 2 {
+		t.Errorf("expected high-bandwidth server (port 2), got %s (port %d)", best.Addr(), best.Port)
+	}
+	if latency < 80*time.Millisecond || latency > 500*time.Millisecond {
+		t.Errorf("latency %v seems unreasonable", latency)
+	}
+	if bw <= 0 {
+		t.Errorf("expected non-zero bandwidth, got %.0f KB/s", bw)
+	}
+}
+
+func TestSelectByBandwidth_allFail(t *testing.T) {
+	orig := dialTunnelFn
+	defer func() { dialTunnelFn = orig }()
+
+	dialTunnelFn = mockDialFn(
+		mockEntry{port: 1, conn: failDialConn()},
+		mockEntry{port: 2, conn: failDialConn()},
+	)
+
+	servers := []Server{
+		{Host: "dead1.test", Port: 1},
+		{Host: "dead2.test", Port: 2},
+	}
+
+	_, _, _, err := SelectByBandwidth(context.Background(), servers, "token", true)
+	if err == nil {
+		t.Fatal("expected error when all servers fail")
+	}
+}
+
+func TestSelectByBandwidth_oneSucceeds(t *testing.T) {
+	orig := dialTunnelFn
+	defer func() { dialTunnelFn = orig }()
+	oldMinMs := MinBandwidthProbeMs
+	MinBandwidthProbeMs = 0
+	defer func() { MinBandwidthProbeMs = oldMinMs }()
+
+	dialTunnelFn = mockDialFn(
+		mockEntry{port: 1, conn: failDialConn()},
+		mockEntry{port: 2, conn: bandwidthPipeConn(15*time.Millisecond, 500*1024, 0)},
+	)
+
+	servers := []Server{
+		{Host: "dead.test", Port: 1},
+		{Host: "alive.test", Port: 2},
+	}
+
+	best, _, _, err := SelectByBandwidth(context.Background(), servers, "token", true)
+	if err != nil {
+		t.Fatalf("expected success for one alive server, got: %v", err)
+	}
+	if best.Port != 2 {
+		t.Errorf("expected port 2 (alive), got port %d", best.Port)
+	}
+}
+
+func TestSelectByBandwidth_emptyServers(t *testing.T) {
+	_, _, _, err := SelectByBandwidth(context.Background(), nil, "token", true)
+	if err == nil {
+		t.Fatal("expected error for empty server list")
+	}
+}
+
+func TestBandwidthScore(t *testing.T) {
+	tests := []struct {
+		latency   time.Duration
+		bandwidth float64
+		wantMin   float64
+		wantMax   float64
+	}{
+		{latency: 100 * time.Millisecond, bandwidth: 1000, wantMin: 200, wantMax: 204}, // 100 + 102
+		{latency: 100 * time.Millisecond, bandwidth: 100, wantMin: 1100, wantMax: 1200}, // 100 + 1024
+		{latency: 100 * time.Millisecond, bandwidth: 42, wantMin: 2500, wantMax: 2600},  // 100 + 2438
+	}
+	for _, tc := range tests {
+		r := benchmarkResult{latency: tc.latency, bandwidth: tc.bandwidth}
+		score := bandwidthScore(r)
+		if score < tc.wantMin || score > tc.wantMax {
+			t.Errorf("bandwidthScore(%v, %.0f KB/s) = %.1f, want between %.1f and %.1f",
+				tc.latency, tc.bandwidth, score, tc.wantMin, tc.wantMax)
+		}
 	}
 }

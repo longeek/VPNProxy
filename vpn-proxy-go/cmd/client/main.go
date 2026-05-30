@@ -29,6 +29,7 @@ func main() {
 	serverPort := flag.Int("server-port", 8443, "remote server port")
 	servers := flag.String("servers", "", "comma-separated server list host:port,host:port for auto-select")
 	probeTimeout := flag.Float64("probe-timeout", 5.0, "per-server probe timeout in seconds")
+	bandwidth := flag.Bool("bandwidth", false, "measure tunnel throughput during server selection (adds ~3s per server)")
 	token := flag.String("token", "", "shared auth token")
 	sni := flag.String("sni", "", "TLS SNI override")
 	insecure := flag.Bool("insecure", false, "skip TLS certificate verification")
@@ -73,17 +74,37 @@ func main() {
 			log.Printf("single server from --servers: %s:%d", cfg.Server, cfg.ServerPort)
 		} else {
 			log.Printf("benchmarking %d servers (this may take a moment)...", len(serverList))
+			// With --bandwidth, the probe includes a 3s bandwidth measurement per server
+			bwFactor := 1.0
+			if *bandwidth {
+				bwFactor = 1.6 // ~3s bandwidth probe + 1s latency per server
+			}
 			probeCtx, cancel := context.WithTimeout(context.Background(),
-				time.Duration(*probeTimeout*float64(len(serverList)))*time.Second)
+				time.Duration(*probeTimeout*bwFactor*float64(len(serverList)))*time.Second)
 			defer cancel()
 
-			best, latency, err := selector.SelectByBenchmark(probeCtx, serverList, *token, *insecure)
+			var best selector.Server
+			var latency time.Duration
+			var err error
+			if *bandwidth {
+				var bw float64
+				best, latency, bw, err = selector.SelectByBandwidth(probeCtx, serverList, *token, *insecure)
+				if err == nil {
+					log.Printf("selected %s (latency=%dms, bandwidth=%.0f KB/s) from %d candidates",
+						best.Addr(), latency.Milliseconds(), bw, len(serverList))
+				}
+			} else {
+				best, latency, err = selector.SelectByBenchmark(probeCtx, serverList, *token, *insecure)
+				if err == nil {
+					log.Printf("selected %s (benchmark=%dms) from %d candidates",
+						best.Addr(), latency.Milliseconds(), len(serverList))
+				}
+			}
 			if err != nil {
 				log.Fatalf("server selection failed: %v", err)
 			}
 			cfg.Server = best.Host
 			cfg.ServerPort = best.Port
-			log.Printf("selected %s (benchmark=%dms) from %d candidates", best.Addr(), latency.Milliseconds(), len(serverList))
 		}
 	} else {
 		if *server == "" {
