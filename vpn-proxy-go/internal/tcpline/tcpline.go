@@ -94,7 +94,7 @@ func findNewline(buf []byte) int {
 func setSocketOpts(conn net.Conn) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
-		tcpConn.SetReadBuffer(256 * 1024)
-		tcpConn.SetWriteBuffer(256 * 1024)
+		tcpConn.SetReadBuffer(tunnel.RecvBufSize)
+		tcpConn.SetWriteBuffer(tunnel.RecvBufSize)
 	}
 }

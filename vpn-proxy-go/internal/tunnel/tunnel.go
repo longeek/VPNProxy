@@ -7,8 +7,8 @@
 //   - Session statistics tracking (upload/download bytes)
 //
 // Pooling strategy:
-//   - relayBufPool: sync.Pool of 128KB relay buffers (reduces GC pressure)
-//   - bufWriterPool: sync.Pool of bufio.Writer with 128KB internal buffer
+//   - relayBufPool: sync.Pool of 512KB relay buffers (reduces GC pressure)
+//   - bufWriterPool: sync.Pool of bufio.Writer with 512KB internal buffer
 package tunnel
 
 import (
@@ -171,14 +171,12 @@ func DialTunnel(ctx context.Context, cfg *Config) (net.Conn, error) {
 	return conn, nil
 }
 
-// Buffer and threshold constants:
-//   - PipeBufSize:   128KB read/write chunk for relay
-//   - DrainThreshold: flush buffered writer when pending >= this
-//   - RecvBufSize:   256KB OS socket buffer (send/recv)
+// Buffer constants:
+//   - PipeBufSize:   512KB read/write chunk for relay (larger = fewer syscalls)
+//   - RecvBufSize:   2MB OS socket buffer for high-BDP links (300ms RTT × ~50Mbps)
 const (
-	PipeBufSize    = 131072
-	DrainThreshold = 128 * 1024
-	RecvBufSize    = 256 * 1024
+	PipeBufSize = 524288
+	RecvBufSize = 2097152
 )
 
 // relayBufPool pools 128KB relay buffers to reduce per-connection allocations.
@@ -252,13 +250,15 @@ func RelayBidirectional(client, tunnel net.Conn, upStats, downStats *uint64) {
 	wg.Wait()
 }
 
-// RelayTCPServer performs bidirectional TCP relay on the server side with
-// threshold-based flushing to balance throughput and latency:
-//   - Data is buffered via a pooled bufio.Writer (128KB internal buffer)
-//   - Flush is triggered when pending data reaches DrainThreshold (128KB)
-//   - This amortizes syscall overhead without introducing head-of-line blocking
+// RelayTCPServer performs bidirectional TCP relay on the server side.
 //
-// Both goroutines use pooled relay buffers and pooled buffered writers.
+// Download (target → tlsConn): uses direct writes to minimize syscalls.
+// TLS handles its own record framing; direct writes avoid bufio overhead
+// for bulk data. This is the throughput-critical direction for video/media.
+//
+// Upload (tlsConn → target): uses per-write flush for low TTFB on
+// interactive requests. Target connections are typically local/US-based,
+// so the flush overhead is negligible compared to RTT savings.
 func RelayTCPServer(tlsConn, target net.Conn, stats *SessionStats) {
 	bufUp := getRelayBuf()
 	bufDown := getRelayBuf()
@@ -266,32 +266,21 @@ func RelayTCPServer(tlsConn, target net.Conn, stats *SessionStats) {
 
 	// Upload: tlsConn → target (client data → backend server)
 	//
-	// Flush after every write to ensure small payloads (e.g. TLS ClientHello
-	// at ~460 bytes) are sent immediately instead of being stuck in the
-	// 128KB bufio buffer. Without this, the target never receives the
-	// request and no data flows back.
+	// Per-write flush ensures small requests (HTTP headers ~4KB) are sent
+	// immediately instead of waiting for the 128..512KB bufio buffer to fill.
 	go func() {
 		defer putRelayBuf(bufUp)
 		bw := GetBufWriter(target)
 		defer PutBufWriter(bw)
-		pending := 0
 		for {
 			n, err := tlsConn.Read(bufUp)
 			if n > 0 {
 				if _, werr := bw.Write(bufUp[:n]); werr != nil {
 					break
 				}
-				pending += n
 				stats.UploadBytes.Add(uint64(n))
 				if bw.Flush() != nil {
 					break
-				}
-				// DrainThreshold is deliberately retained so that, for
-				// bulk transfers, we still batch flushes at a higher
-				// watermark; the per-write flush above guarantees
-				// interactivity for small payloads.
-				if pending >= DrainThreshold {
-					pending = 0
 				}
 			}
 			if err != nil {
@@ -304,24 +293,19 @@ func RelayTCPServer(tlsConn, target net.Conn, stats *SessionStats) {
 
 	// Download: target → tlsConn (backend response → client)
 	//
-	// Per-write flush strategy (same as upload). On high-latency links
-	// (220ms RTT to China) the bottleneck is the TCP congestion window
-	// on the international link, not the flush overhead. Per-write flush
-	// ensures the lowest possible TTFB for interactive responses.
+	// Direct tlsConn.Write — no bufio wrapper. TLS record framing (16KB max)
+	// provides batching; syscall per write is one TCP send, which is optimal
+	// for bulk data. With PipeBufSize=512KB, this yields ~32 TLS records per
+	// iteration with zero intermediate buffering overhead.
 	go func() {
 		defer putRelayBuf(bufDown)
-		bw := GetBufWriter(tlsConn)
-		defer PutBufWriter(bw)
 		for {
 			n, err := target.Read(bufDown)
 			if n > 0 {
-				if _, werr := bw.Write(bufDown[:n]); werr != nil {
+				if _, werr := tlsConn.Write(bufDown[:n]); werr != nil {
 					break
 				}
 				stats.DownloadBytes.Add(uint64(n))
-				if bw.Flush() != nil {
-					break
-				}
 			}
 			if err != nil {
 				break

@@ -202,19 +202,13 @@ func TestConfig_BuildTLSConfigWithCACert(t *testing.T) {
 }
 
 func TestPipeBufSize(t *testing.T) {
-	if PipeBufSize != 131072 {
-		t.Errorf("Expected PipeBufSize 131072, got %d", PipeBufSize)
-	}
-}
-
-func TestDrainThreshold(t *testing.T) {
-	if DrainThreshold != 128*1024 {
-		t.Errorf("Expected DrainThreshold %d, got %d", 128*1024, DrainThreshold)
+	if PipeBufSize != 524288 {
+		t.Errorf("Expected PipeBufSize 524288, got %d", PipeBufSize)
 	}
 }
 
 func TestRecvBufSize(t *testing.T) {
-	if RecvBufSize != 256*1024 {
-		t.Errorf("Expected RecvBufSize %d, got %d", 256*1024, RecvBufSize)
+	if RecvBufSize != 2097152 {
+		t.Errorf("Expected RecvBufSize %d, got %d", 2097152, RecvBufSize)
 	}
 }

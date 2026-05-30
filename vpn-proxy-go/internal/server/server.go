@@ -82,7 +82,7 @@ func (r *rateLimiter) Allow() bool {
 var connLimiter = newRateLimiter(100, 20)
 
 const (
-	recvBufSize    = 256 * 1024
+	recvBufSize    = 2097152
 	pipeBufSize    = 131072
 	drainThreshold = 128 * 1024
 )
