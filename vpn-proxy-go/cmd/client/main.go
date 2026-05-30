@@ -39,6 +39,7 @@ func main() {
 	poolSize := flag.Int("pool-size", 8, "tunnel pool size (0=disabled)")
 	poolTTL := flag.Float64("pool-ttl", 60.0, "tunnel pool TTL seconds")
 	reuse := flag.Bool("reuse", false, "enable TCP tunnel reuse (keep connections alive across relays)")
+	prefer := flag.String("prefer", "", "preferred server host (select this server if reachable, fallback to benchmark)")
 	proxyUser := flag.String("proxy-user", "", "proxy auth username")
 	proxyPass := flag.String("proxy-pass", "", "proxy auth password")
 
@@ -96,7 +97,7 @@ func main() {
 						best.Addr(), latency.Milliseconds(), bw, len(serverList))
 				}
 			} else {
-				best, latency, err = selector.SelectByBenchmark(probeCtx, serverList, *token, *insecure)
+				best, latency, err = selector.SelectByBenchmark(probeCtx, serverList, *token, *insecure, *prefer)
 				if err == nil {
 					log.Printf("selected %s (benchmark=%dms) from %d candidates",
 						best.Addr(), latency.Milliseconds(), len(serverList))

@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"sort"
 	"strings"
@@ -123,7 +124,11 @@ type benchmarkResult struct {
 // SelectByBenchmark probes servers in parallel by creating a real TLS
 // tunnel through each, bootstrapping to a probe target, and measuring
 // the time to receive the first byte of response data.
-func SelectByBenchmark(ctx context.Context, servers []Server, token string, insecure bool) (Server, time.Duration, error) {
+//
+// If preferredHost is non-empty, that server is selected if reachable,
+// regardless of latency. This allows pinning a preferred server (e.g.
+// a US-based server) while keeping others as automatic fallbacks.
+func SelectByBenchmark(ctx context.Context, servers []Server, token string, insecure bool, preferredHost ...string) (Server, time.Duration, error) {
 	if len(servers) == 0 {
 		return Server{}, 0, fmt.Errorf("no servers to benchmark")
 	}
@@ -158,6 +163,18 @@ func SelectByBenchmark(ctx context.Context, servers []Server, token string, inse
 			}
 		}
 		return Server{}, 0, fmt.Errorf("all servers unreachable")
+	}
+
+	// If a preferred host is specified and reachable, select it regardless
+	// of latency ranking.
+	if len(preferredHost) > 0 && preferredHost[0] != "" {
+		for _, r := range reachable {
+			if r.server.Host == preferredHost[0] {
+				log.Printf("preferred server %s:%d is reachable (latency=%dms)", r.server.Host, r.server.Port, r.latency.Milliseconds())
+				return r.server, r.latency, nil
+			}
+		}
+		log.Printf("preferred server %q unreachable, falling back to latency sort", preferredHost[0])
 	}
 
 	sort.Slice(reachable, func(i, j int) bool {
