@@ -110,6 +110,7 @@ type BootstrapRequest struct {
 	Host  string `json:"host"`
 	Port  uint16 `json:"port"`
 	Proto string `json:"proto,omitempty"`
+	Reuse bool   `json:"reuse,omitempty"`
 }
 
 // ParseBootstrapJSON unmarshals the raw JSON line into a BootstrapRequest.
@@ -157,6 +158,18 @@ func parseBootstrapLine(line string, allowedTokens map[string]bool) (host string
 		return "", 0, "", err
 	}
 	return req.Host, req.Port, req.Proto, nil
+}
+
+// parseBootstrapLineFull returns parsed fields including the Reuse flag.
+func parseBootstrapLineFull(line string, allowedTokens map[string]bool) (host string, port uint16, proto string, reuse bool, err error) {
+	req, err := ParseBootstrapJSON(line)
+	if err != nil {
+		return "", 0, "", false, err
+	}
+	if err := ValidateBootstrapRequest(req, allowedTokens); err != nil {
+		return "", 0, "", false, err
+	}
+	return req.Host, req.Port, req.Proto, req.Reuse, nil
 }
 
 // LoadAllowedTokens loads tokens from --token flag and/or --tokens-file.
@@ -488,13 +501,40 @@ func setClientSocketOpts(tlsConn net.Conn) {
 	}
 }
 
+// handleTCPRelayReuse relays traffic for a single target over a ReusableTunnel.
+// After the relay completes, control returns to the caller for the next bootstrap.
+func handleTCPRelayReuse(rt *tunnel.ReusableTunnel, host string, port uint16, stats *tunnel.SessionStats, sessionID string, connectTimeout time.Duration) {
+	targetAddr, err := resolveHost(host, port)
+	if err != nil {
+		log.Printf("[sid=%s] DNS lookup failed for %s:%d: %v", sessionID, host, port, err)
+		return
+	}
+	target, err := net.DialTimeout("tcp", targetAddr, connectTimeout)
+	if err != nil {
+		log.Printf("[sid=%s] backend connect failed to %s: %v", sessionID, targetAddr, err)
+		return
+	}
+	if tcpConn, ok := target.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+		tcpConn.SetReadBuffer(recvBufSize)
+		tcpConn.SetWriteBuffer(recvBufSize)
+	}
+
+	tunnel.RelayTCPServerReuse(rt, target, stats)
+
+	totalUp := stats.UploadBytes.Load()
+	totalDown := stats.DownloadBytes.Load()
+	log.Printf("[sid=%s] session closed (up=%d bytes, down=%d bytes)", sessionID, totalUp, totalDown)
+}
+
 // handleClient processes a single client connection.
 //
 // Workflow:
 //  1. Rate limiting check
 //  2. CIDR allowlist check
 //  3. Read bootstrap line (JSON with auth + target)
-//  4. Route to TCP relay (with DNS cache) or UDP relay
+//  4. If reuse mode: loop reading chunk-based bootstrap + RelayTCPServerReuse
+//  5. Else: single TCP relay (legacy) or UDP relay
 //
 // The connection is always closed in the defer at the end.
 func handleClient(tlsConn net.Conn, ctx *AppConfig) {
@@ -527,7 +567,7 @@ func handleClient(tlsConn net.Conn, ctx *AppConfig) {
 		return
 	}
 
-	host, port, proto, err := parseBootstrapLine(line, ctx.AllowedTokens)
+	host, port, proto, reuse, err := parseBootstrapLineFull(line, ctx.AllowedTokens)
 	if err != nil {
 		log.Printf("[sid=%s] bootstrap error from %s: %v", sessionID, peer, err)
 		if err.Error() == "ERR auth" {
@@ -538,13 +578,54 @@ func handleClient(tlsConn net.Conn, ctx *AppConfig) {
 		return
 	}
 
-	log.Printf("[sid=%s] accepted tunnel from %s to %s:%d (%s)", sessionID, peer, host, port, proto)
+	log.Printf("[sid=%s] accepted tunnel from %s to %s:%d (%s) [reuse=%v]", sessionID, peer, host, port, proto, reuse)
 
 	if proto == "udp" {
 		handleUDPRelay(tlsConn, stats, host, port, sessionID)
-	} else {
-		tlsConn.Write([]byte("OK\n"))
+		return
+	}
+
+	// TCP relay
+	tlsConn.Write([]byte("OK\n"))
+
+	if !reuse {
+		// Legacy mode: single relay, connection closes afterward
 		handleTCPRelay(tlsConn, host, port, stats, sessionID, ctx.ConnectTimeout)
+		return
+	}
+
+	// Reuse mode: wrap in ReusableTunnel, loop for subsequent bootstraps
+	rt := tunnel.NewReusableTunnel(tlsConn)
+
+	// First relay (target from initial bootstrap)
+	handleTCPRelayReuse(rt, host, port, stats, sessionID, ctx.ConnectTimeout)
+
+	// Subsequent relays: read bootstrap chunks from the same connection
+	for {
+		chunk, err := rt.ReadBootstrapChunk()
+		if err != nil {
+			log.Printf("[sid=%s] reuse bootstrap read failed: %v", sessionID, err)
+			return
+		}
+		req, pErr := ParseBootstrapJSON(string(chunk))
+		if pErr != nil {
+			log.Printf("[sid=%s] reuse bootstrap parse error: %v", sessionID, pErr)
+			return
+		}
+		if vErr := ValidateBootstrapRequest(req, ctx.AllowedTokens); vErr != nil {
+			log.Printf("[sid=%s] reuse bootstrap invalid: %v", sessionID, vErr)
+			return
+		}
+
+		log.Printf("[sid=%s] reuse relay to %s:%d", sessionID, req.Host, req.Port)
+
+		// Send OK chunk acknowledgment
+		if wErr := rt.WriteOKChunk(); wErr != nil {
+			log.Printf("[sid=%s] reuse write OK failed: %v", sessionID, wErr)
+			return
+		}
+
+		handleTCPRelayReuse(rt, req.Host, req.Port, stats, sessionID, ctx.ConnectTimeout)
 	}
 }
 

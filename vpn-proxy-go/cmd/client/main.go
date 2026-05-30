@@ -38,6 +38,7 @@ func main() {
 	retryDelay := flag.Float64("retry-delay", 0.8, "retry delay seconds")
 	poolSize := flag.Int("pool-size", 8, "tunnel pool size (0=disabled)")
 	poolTTL := flag.Float64("pool-ttl", 60.0, "tunnel pool TTL seconds")
+	reuse := flag.Bool("reuse", false, "enable TCP tunnel reuse (keep connections alive across relays)")
 	proxyUser := flag.String("proxy-user", "", "proxy auth username")
 	proxyPass := flag.String("proxy-pass", "", "proxy auth password")
 
@@ -59,6 +60,7 @@ func main() {
 		CACert:     *caCert,
 		Retries:    uint32(*connectRetries),
 		RetryDelay: *retryDelay,
+		Reuse:      *reuse,
 	}
 
 	// Server selection: --servers (multi, auto-probe) or --server/--server-port (single, backward compat)

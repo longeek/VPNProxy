@@ -34,8 +34,11 @@ import (
 
 // entry represents a single pooled connection with its creation timestamp.
 // TTL is checked on Acquire() and during the eviction loop.
+// If reuse=true, the connection is in tunnel-reuse mode: subsequent
+// bootstraps must use the chunk protocol instead of raw JSON.
 type entry struct {
 	conn    net.Conn
+	reuse   bool
 	created time.Time
 }
 
@@ -145,9 +148,41 @@ func (p *Pool) fillOne(ctx context.Context) {
 	p.entries = append(p.entries, entry{conn: conn, created: time.Now()})
 }
 
+// bootstrapReuse sends a bootstrap chunk on a reused connection and waits
+// for the server's OK chunk. Used for pool entries that have been returned
+// via ReleaseReuse.
+func (p *Pool) bootstrapReuse(conn net.Conn, targetHost string, targetPort uint16, proto string) error {
+	rt := tunnel.NewReusableTunnel(conn)
+	payload := tunnel.BootstrapInfo{
+		Auth:  p.cfg.Token,
+		Host:  targetHost,
+		Port:  targetPort,
+		Proto: proto,
+		Reuse: true,
+	}
+	if proto == "tcp" {
+		payload.Proto = ""
+	}
+	bs, _ := json.Marshal(payload)
+	if err := rt.WriteBootstrapChunk(bs); err != nil {
+		return err
+	}
+	ok, err := rt.ReadOKChunk()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("server refused reuse bootstrap")
+	}
+	return nil
+}
+
 // Acquire pops a warm TLS connection from the pool, sends a bootstrap to
 // assign the real target, waits for the server's OK, and returns the
 // connection ready for relay.
+//
+// For reuse-mode entries (returned via ReleaseReuse), the bootstrap is sent
+// as a chunk (BOOTSTRAP type). For fresh entries, it is sent as raw JSON.
 //
 // After each attempt (hit or miss), one async fill is triggered to maintain
 // pool depth during active use. This ensures the pool naturally fills up to
@@ -164,13 +199,17 @@ func (p *Pool) Acquire(ctx context.Context, targetHost string, targetPort uint16
 		}
 		if time.Since(candidate.created) >= p.ttl {
 			candidate.conn.Close()
-			// Trigger async fill after discarding expired entry
 			go p.fillOne(ctx)
 			continue
 		}
-		if err := p.bootstrap(candidate.conn, targetHost, targetPort, proto); err != nil {
+		var berr error
+		if candidate.reuse {
+			berr = p.bootstrapReuse(candidate.conn, targetHost, targetPort, proto)
+		} else {
+			berr = p.bootstrap(candidate.conn, targetHost, targetPort, proto)
+		}
+		if berr != nil {
 			candidate.conn.Close()
-			// Trigger async fill after failed bootstrap
 			go p.fillOne(ctx)
 			continue
 		}
@@ -178,7 +217,7 @@ func (p *Pool) Acquire(ctx context.Context, targetHost string, targetPort uint16
 		go p.fillOne(ctx)
 		atomic.AddUint64(&p.hits, 1)
 		n := atomic.LoadUint64(&p.hits)
-		log.Printf("pool HIT #%d for %s:%d", n, targetHost, targetPort)
+		log.Printf("pool HIT #%d for %s:%d (reuse=%v)", n, targetHost, targetPort, candidate.reuse)
 		return candidate.conn, nil
 	}
 
@@ -209,6 +248,7 @@ func (p *Pool) bootstrap(conn net.Conn, targetHost string, targetPort uint16, pr
 		Host:  targetHost,
 		Port:  targetPort,
 		Proto: proto,
+		Reuse: p.cfg.Reuse,
 	}
 	if proto == "tcp" {
 		payload.Proto = ""
@@ -228,6 +268,42 @@ func (p *Pool) bootstrap(conn net.Conn, targetHost string, targetPort uint16, pr
 		return nil
 	}
 	return fmt.Errorf("server refused: %s", strings.TrimSpace(status))
+}
+
+// Release returns a used connection back to the pool for potential reuse.
+// The connection should have completed its relay (not in reuse mode) and
+// be ready for a new bootstrap. If the pool is at maxSize or closed, the
+// connection is closed immediately.
+func (p *Pool) Release(conn net.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		conn.Close()
+		return
+	}
+	if len(p.entries) >= p.maxSize {
+		conn.Close()
+		return
+	}
+	p.entries = append(p.entries, entry{conn: conn, created: time.Now()})
+}
+
+// ReleaseReuse returns a reuse-mode connection back to the pool after a
+// chunk-protocol relay. The connection is stored with reuse=true so that a
+// subsequent Acquire will use the chunk-based bootstrap (BOOTSTRAP chunk)
+// instead of the raw JSON bootstrap.
+func (p *Pool) ReleaseReuse(conn net.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		conn.Close()
+		return
+	}
+	if len(p.entries) >= p.maxSize {
+		conn.Close()
+		return
+	}
+	p.entries = append(p.entries, entry{conn: conn, reuse: true, created: time.Now()})
 }
 
 // PoolStats returns the cumulative pool hit count.

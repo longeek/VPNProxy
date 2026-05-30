@@ -35,7 +35,8 @@ type Config struct {
 	CACert     string
 	Retries    uint32
 	RetryDelay float64
-	tlsCache   *tls.Config // cached TLS config for session resumption
+	Reuse      bool         // enable tunnel reuse (length-prefixed chunk protocol)
+	tlsCache   *tls.Config  // cached TLS config for session resumption
 }
 
 // BootstrapInfo is the JSON payload sent over a new tunnel connection
@@ -45,6 +46,7 @@ type BootstrapInfo struct {
 	Host  string `json:"host"`
 	Port  uint16 `json:"port"`
 	Proto string `json:"proto,omitempty"`
+	Reuse bool   `json:"reuse,omitempty"`
 }
 
 // buildTLSConfig creates a tls.Config with:
@@ -119,6 +121,7 @@ func Open(ctx context.Context, cfg *Config, targetHost string, targetPort uint16
 			Host:  targetHost,
 			Port:  targetPort,
 			Proto: proto,
+			Reuse: cfg.Reuse,
 		}
 		if proto == "tcp" {
 			payload.Proto = ""
