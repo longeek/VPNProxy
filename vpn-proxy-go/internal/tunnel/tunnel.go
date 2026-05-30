@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -135,21 +134,23 @@ func Open(ctx context.Context, cfg *Config, targetHost string, targetPort uint16
 			continue
 		}
 
+		// Read exact status line (terminated by \n).
+		// IMPORTANT: do NOT use conn.Read(buf) with a large buffer — the server
+		// may send relay data (chunk headers) immediately after "OK\n" and a
+		// buffered read would consume those bytes, corrupting the stream.
 		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-		statusBuf := make([]byte, 128)
-		n, err := conn.Read(statusBuf)
+		statusLine, sErr := readLine(conn)
 		conn.SetReadDeadline(time.Time{})
-		if err != nil {
+		if sErr != nil {
 			conn.Close()
-			lastErr = err
+			lastErr = sErr
 			continue
 		}
-		status := string(statusBuf[:n])
-		if strings.HasPrefix(status, "OK") {
+		if statusLine == "OK" {
 			return conn, nil
 		}
 		conn.Close()
-		lastErr = fmt.Errorf("server refused: %s", strings.TrimSpace(status))
+		lastErr = fmt.Errorf("server refused: %s", statusLine)
 	}
 
 	return nil, fmt.Errorf("all retries exhausted: %v", lastErr)
@@ -196,6 +197,25 @@ func getRelayBuf() []byte {
 
 func putRelayBuf(b []byte) {
 	relayBufPool.Put(&b)
+}
+
+// readLine reads from r byte-by-byte until '\n' and returns the line
+// content without the trailing '\n'. This is used for reading status
+// responses from the server. Byte-by-byte reading ensures we never consume
+// more bytes than the status line itself — critical because the server may
+// send relay data immediately after the status line.
+func readLine(r io.Reader) (string, error) {
+	var line []byte
+	one := make([]byte, 1)
+	for {
+		if _, err := io.ReadFull(r, one); err != nil {
+			return "", err
+		}
+		if one[0] == '\n' {
+			return string(line), nil
+		}
+		line = append(line, one[0])
+	}
 }
 
 // bufWriterPool pools bufio.Writer objects to reduce per-connection allocations.

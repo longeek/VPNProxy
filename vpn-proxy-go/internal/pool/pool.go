@@ -22,9 +22,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -258,16 +258,18 @@ func (p *Pool) bootstrap(conn net.Conn, targetHost string, targetPort uint16, pr
 	if _, err := conn.Write(bs); err != nil {
 		return err
 	}
-	statusBuf := make([]byte, 128)
-	n, err := conn.Read(statusBuf)
+	// Read exact status line (terminated by \n).
+	// IMPORTANT: do NOT use conn.Read(buf) with a large buffer — the server
+	// may send relay data (chunk headers) immediately after "OK\n" and a
+	// buffered read would consume those bytes, corrupting the stream.
+	statusLine, err := readLine(conn)
 	if err != nil {
 		return err
 	}
-	status := string(statusBuf[:n])
-	if strings.HasPrefix(status, "OK") {
+	if statusLine == "OK" {
 		return nil
 	}
-	return fmt.Errorf("server refused: %s", strings.TrimSpace(status))
+	return fmt.Errorf("server refused: %s", statusLine)
 }
 
 // Release returns a used connection back to the pool for potential reuse.
@@ -309,6 +311,23 @@ func (p *Pool) ReleaseReuse(conn net.Conn) {
 // PoolStats returns the cumulative pool hit count.
 func (p *Pool) PoolStats() uint64 {
 	return atomic.LoadUint64(&p.hits)
+}
+
+// readLine reads from r byte-by-byte until '\n'. This ensures we never
+// consume more bytes than the status line itself — critical because the
+// server may send relay data immediately after "OK\n".
+func readLine(r io.Reader) (string, error) {
+	var line []byte
+	one := make([]byte, 1)
+	for {
+		if _, err := io.ReadFull(r, one); err != nil {
+			return "", err
+		}
+		if one[0] == '\n' {
+			return string(line), nil
+		}
+		line = append(line, one[0])
+	}
 }
 
 // Stop closes all pooled connections and stops the eviction loop.

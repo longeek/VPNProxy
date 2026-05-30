@@ -70,7 +70,15 @@ func (h *Handler) Handle(client net.Conn) {
 
 	client.Write([]byte("OK\n"))
 	log.Printf("TCP tunnel OK -> %s:%d", targetHost, targetPort)
-	tunnel.RelayBidirectional(client, tunnelConn, nil, nil)
+
+	if h.Cfg != nil && h.Cfg.Reuse && h.Pool != nil {
+		// Reuse mode: chunk-based relay, return connection to pool when done
+		rt := tunnel.NewReusableTunnel(tunnelConn)
+		tunnel.RelayBidirectionalReuse(client, rt, nil, nil)
+		h.Pool.ReleaseReuse(tunnelConn)
+	} else {
+		tunnel.RelayBidirectional(client, tunnelConn, nil, nil)
+	}
 }
 
 func containsNewline(buf []byte) bool {
