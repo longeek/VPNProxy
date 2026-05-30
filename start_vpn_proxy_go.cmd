@@ -7,10 +7,11 @@ echo   VPN Proxy Client (Go) - Reuse Mode
 echo   SOCKS5: 127.0.0.1:1080
 echo   HTTP:   127.0.0.1:8080
 echo   Pool:   32 connections, 120s TTL
+echo   Server: 47.88.49.28:443 (US)
 echo ========================================
 echo.
 
-"bin\vpn-proxy-client.exe" --listen 127.0.0.1 --listen-port 1080 --servers 47.88.49.28:443,47.79.229.128:443 --token 34db557e51e033b80ff4fc9cc42efb305055f57f50cd4226aaaedd3f160bf78a --http-port 8080 --insecure --reuse --pool-size 32 --pool-ttl 120
+"bin\vpn-proxy-client.exe" --listen 127.0.0.1 --listen-port 1080 --servers 47.88.49.28:443 --token 34db557e51e033b80ff4fc9cc42efb305055f57f50cd4226aaaedd3f160bf78a --http-port 8080 --insecure --reuse --pool-size 32 --pool-ttl 120
 
 if errorlevel 1 (
   echo.
