@@ -8,11 +8,13 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"time"
 
 	"vpn-proxy-go/internal/httpproxy"
 	"vpn-proxy-go/internal/pool"
+	"vpn-proxy-go/internal/selector"
 	"vpn-proxy-go/internal/socks"
 	"vpn-proxy-go/internal/tcpline"
 	"vpn-proxy-go/internal/tunnel"
@@ -23,25 +25,23 @@ func main() {
 	listenPort := flag.Int("listen-port", 1080, "local SOCKS5 listen port")
 	httpPort := flag.Int("http-port", 0, "local HTTP CONNECT listen port (0=disabled)")
 	tcpLinePort := flag.Int("tcp-line-port", 0, "local TCP line listen port (0=disabled)")
-	server := flag.String("server", "", "remote server host")
+	server := flag.String("server", "", "remote server host (ignored if --servers is set)")
 	serverPort := flag.Int("server-port", 8443, "remote server port")
+	servers := flag.String("servers", "", "comma-separated server list host:port,host:port for auto-select")
+	probeTimeout := flag.Float64("probe-timeout", 5.0, "per-server probe timeout in seconds")
 	token := flag.String("token", "", "shared auth token")
 	sni := flag.String("sni", "", "TLS SNI override")
 	insecure := flag.Bool("insecure", false, "skip TLS certificate verification")
 	caCert := flag.String("ca-cert", "", "CA certificate file")
 	connectRetries := flag.Int("connect-retries", 2, "number of retries")
 	retryDelay := flag.Float64("retry-delay", 0.8, "retry delay seconds")
-	poolSize := flag.Int("pool-size", 0, "tunnel pool size (0=disabled)")
-	poolTTL := flag.Float64("pool-ttl", 8.0, "tunnel pool TTL seconds")
+	poolSize := flag.Int("pool-size", 8, "tunnel pool size (0=disabled)")
+	poolTTL := flag.Float64("pool-ttl", 60.0, "tunnel pool TTL seconds")
 	proxyUser := flag.String("proxy-user", "", "proxy auth username")
 	proxyPass := flag.String("proxy-pass", "", "proxy auth password")
 
 	flag.Parse()
 
-	if *server == "" {
-		fmt.Fprintln(os.Stderr, "missing --server")
-		os.Exit(1)
-	}
 	if *token == "" {
 		fmt.Fprintln(os.Stderr, "missing --token")
 		os.Exit(1)
@@ -52,14 +52,47 @@ func main() {
 	}
 
 	cfg := &tunnel.Config{
-		Server:     *server,
-		ServerPort: uint16(*serverPort),
 		Token:      *token,
 		SNI:        *sni,
 		Insecure:   *insecure,
 		CACert:     *caCert,
 		Retries:    uint32(*connectRetries),
 		RetryDelay: *retryDelay,
+	}
+
+	// Server selection: --servers (multi, auto-probe) or --server/--server-port (single, backward compat)
+	if *servers != "" {
+		serverList := parseServers(*servers)
+		if len(serverList) == 0 {
+			fmt.Fprintln(os.Stderr, "invalid --servers format; expected host:port,host:port")
+			os.Exit(1)
+		}
+		if len(serverList) == 1 {
+			cfg.Server = serverList[0].Host
+			cfg.ServerPort = serverList[0].Port
+			log.Printf("single server from --servers: %s:%d", cfg.Server, cfg.ServerPort)
+		} else {
+			log.Printf("benchmarking %d servers (this may take a moment)...", len(serverList))
+			probeCtx, cancel := context.WithTimeout(context.Background(),
+				time.Duration(*probeTimeout*float64(len(serverList)))*time.Second)
+			defer cancel()
+
+			best, latency, err := selector.SelectByBenchmark(probeCtx, serverList, *token, *insecure)
+			if err != nil {
+				log.Fatalf("server selection failed: %v", err)
+			}
+			cfg.Server = best.Host
+			cfg.ServerPort = best.Port
+			log.Printf("selected %s (benchmark=%dms) from %d candidates", best.Addr(), latency.Milliseconds(), len(serverList))
+		}
+	} else {
+		if *server == "" {
+			fmt.Fprintln(os.Stderr, "missing --server (or use --servers for multi-server auto-select)")
+			os.Exit(1)
+		}
+		cfg.Server = *server
+		cfg.ServerPort = uint16(*serverPort)
+		log.Printf("single server (legacy mode): %s:%d", cfg.Server, cfg.ServerPort)
 	}
 
 	var pl *pool.Pool
@@ -140,4 +173,29 @@ func main() {
 		pl.Stop()
 	}
 	wg.Wait()
+}
+
+// parseServers parses a comma-separated list of "host:port" entries
+// into a slice of Server values for probing and selection.
+func parseServers(input string) []selector.Server {
+	parts := strings.Split(input, ",")
+	var result []selector.Server
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		host, portStr, err := net.SplitHostPort(p)
+		if err != nil {
+			log.Printf("warning: skipping invalid server entry %q: %v", p, err)
+			continue
+		}
+		portNum, err := net.LookupPort("tcp", portStr)
+		if err != nil {
+			log.Printf("warning: skipping invalid port in %q: %v", p, err)
+			continue
+		}
+		result = append(result, selector.Server{Host: host, Port: uint16(portNum)})
+	}
+	return result
 }

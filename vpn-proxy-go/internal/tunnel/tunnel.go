@@ -152,6 +152,25 @@ func Open(ctx context.Context, cfg *Config, targetHost string, targetPort uint16
 	return nil, fmt.Errorf("all retries exhausted: %v", lastErr)
 }
 
+// DialTunnel establishes a raw TLS connection to the proxy server
+// without sending a bootstrap. Used by the connection pool to pre-warm
+// TLS sessions. The caller must send a BootstrapInfo to assign a target
+// before using the connection for relay.
+func DialTunnel(ctx context.Context, cfg *Config) (net.Conn, error) {
+	tlsCfg, err := cfg.cachedTLSConfig()
+	if err != nil {
+		return nil, err
+	}
+	addr := fmt.Sprintf("%s:%d", cfg.Server, cfg.ServerPort)
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
+	if err != nil {
+		return nil, err
+	}
+	setTunnelSocketOpts(conn)
+	return conn, nil
+}
+
 // Buffer and threshold constants:
 //   - PipeBufSize:   128KB read/write chunk for relay
 //   - DrainThreshold: flush buffered writer when pending >= this

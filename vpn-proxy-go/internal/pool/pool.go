@@ -2,16 +2,27 @@
 // setup latency by avoiding full TLS handshakes on cache hits.
 //
 // Architecture:
-//   - Pre-establishes connections to a dummy target ("0.0.0.0:1") on Start()
-//   - On Acquire(), re-bootstraps a pooled connection with the real target
-//   - A background refill loop evicts expired entries (TTL) and replenishes
+//   - Lazy fill: starts empty; connections are created on-demand after Acquire
+//   - Each Acquire that pops a warm connection triggers async refill of one
+//   - A background eviction loop removes stale entries (prevents goroutine leak)
 //   - FIFO eviction ensures connections age evenly through the pool
+//
+// Key difference from a naive pool:
+//   - Warm connections are raw TLS sockets (not full bootstrapped tunnels)
+//   - Each Acquire sends the target bootstrap + waits for OK (one RTT)
+//   - Pool hit saves the full TLS handshake (~2 RTTs) compared to tunnel.Open
+//
+// Start optimization:
+//   - Start() launches the eviction loop and returns immediately
+//   - No eager pre-warming — avoids wasted connections when idle
+//   - Pool fills naturally during active use
 package pool
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"strings"
 	"sync"
@@ -22,18 +33,18 @@ import (
 )
 
 // entry represents a single pooled connection with its creation timestamp.
-// TTL is checked on Acquire() and during refill loop eviction.
+// TTL is checked on Acquire() and during the eviction loop.
 type entry struct {
 	conn    net.Conn
 	created time.Time
 }
 
-// Pool is a pre-warmed TLS connection pool.
+// Pool is a lazy-fill TLS connection pool.
 //
-// The pool maintains a set of connections to the proxy server using a
-// dummy target. When a real target is requested via Acquire(), the
-// connection is re-bootstrapped with the actual target, avoiding the
-// cost of a new TLS handshake.
+// The pool starts empty. After each Acquire that pops a warm connection,
+// one replacement is created asynchronously to maintain up to maxSize
+// connections during active use. A background eviction loop removes
+// expired entries that were never acquired.
 type Pool struct {
 	mu      sync.Mutex
 	entries []entry
@@ -41,60 +52,45 @@ type Pool struct {
 	maxSize int           // maximum number of warm connections to maintain
 	ttl     time.Duration // max age of a pooled connection before eviction
 	hits    uint64        // total pool hits (for diagnostics)
+	filling int32         // number of in-flight fill operations
 	closed  bool
+
+	// dialFn creates a raw TLS connection for pool warming.
+	// Override in tests to avoid real network calls.
+	dialFn func(context.Context, *tunnel.Config) (net.Conn, error)
+	// openFn creates a fully-bootstrapped tunnel (fallback on pool miss).
+	// Override in tests to avoid real network calls.
+	openFn func(context.Context, *tunnel.Config, string, uint16, string) (net.Conn, error)
 }
 
-// New creates a new Pool but does not start it. Call Start() to begin
-// pre-warming connections and the background refill loop.
+// New creates a new Pool. Call Start() to begin the eviction loop.
+// dialFn and openFn default to tunnel.DialTunnel and tunnel.Open respectively;
+// they are exposed as fields so tests can supply mocks.
 func New(cfg *tunnel.Config, maxSize int, ttl time.Duration) *Pool {
 	return &Pool{
 		cfg:     cfg,
 		maxSize: maxSize,
 		ttl:     ttl,
+		dialFn:  tunnel.DialTunnel,
+		openFn:  tunnel.Open,
 	}
 }
 
-// Start pre-warms maxSize connections to the dummy target "0.0.0.0:1" and
-// launches the background refill goroutine. Blocks until all initial
-// connections are established (or fail, in which case the pool starts
-// partially filled).
+// Start launches the background eviction loop and returns immediately.
+// No connections are pre-warmed; the pool fills on demand during active use.
 func (p *Pool) Start(ctx context.Context) {
 	p.mu.Lock()
 	p.closed = false
 	p.mu.Unlock()
 
-	// Concurrently establish all warm connections
-	var wg sync.WaitGroup
-	var localMu sync.Mutex
-	var localEntries []entry
-	for i := 0; i < p.maxSize; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			conn, err := tunnel.Open(ctx, p.cfg, "0.0.0.0", 1, "tcp")
-			if err == nil {
-				localMu.Lock()
-				localEntries = append(localEntries, entry{conn: conn, created: time.Now()})
-				localMu.Unlock()
-			}
-		}()
-	}
-	wg.Wait()
-
-	p.mu.Lock()
-	p.entries = localEntries
-	p.mu.Unlock()
-	go p.refillLoop(ctx)
+	go p.evictLoop(ctx)
 }
 
-// refillLoop runs in a background goroutine, ticking every 300ms to:
-//  1. Evict entries whose TTL has expired
-//  2. Replenish up to maxSize connections (batch creates all missing at once)
-//
-// Uses batch creation rather than single-connection per cycle to avoid
-// slow ramp-up when the pool is completely empty.
-func (p *Pool) refillLoop(ctx context.Context) {
-	ticker := time.NewTicker(300 * time.Millisecond)
+// evictLoop runs periodically to remove expired entries.
+// Unlike a traditional fill loop, it never creates new connections —
+// filling happens on-demand after Acquire.
+func (p *Pool) evictLoop(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -107,9 +103,6 @@ func (p *Pool) refillLoop(ctx context.Context) {
 			p.mu.Unlock()
 			return
 		}
-
-		// In-place compaction: keep non-expired entries, close expired ones.
-		// This avoids allocating a new slice on every tick.
 		now := time.Now()
 		n := 0
 		for i := 0; i < len(p.entries); i++ {
@@ -121,34 +114,48 @@ func (p *Pool) refillLoop(ctx context.Context) {
 			}
 		}
 		p.entries = p.entries[:n]
-		need := p.maxSize - len(p.entries)
 		p.mu.Unlock()
-
-		if need <= 0 {
-			continue
-		}
-
-		// Batch-create all needed connections (faster than 1-per-cycle)
-		var fresh []entry
-		for i := 0; i < need; i++ {
-			conn, err := tunnel.Open(ctx, p.cfg, "0.0.0.0", 1, "tcp")
-			if err != nil {
-				break
-			}
-			fresh = append(fresh, entry{conn: conn, created: time.Now()})
-		}
-		if len(fresh) > 0 {
-			p.mu.Lock()
-			p.entries = append(p.entries, fresh...)
-			p.mu.Unlock()
-		}
 	}
 }
 
-// Acquire pops a warm connection from the pool, re-bootstraps it to the
-// requested target, and returns it. If the pool is empty or all candidates
-// fail (expired TTL, bootstrap failure), falls through to tunnel.Open()
-// which establishes a fresh connection.
+// fillOne creates a single raw TLS connection and adds it to the pool.
+// Uses an atomic counter to prevent more than maxSize concurrent fills.
+func (p *Pool) fillOne(ctx context.Context) {
+	if atomic.AddInt32(&p.filling, 1) > int32(p.maxSize) {
+		atomic.AddInt32(&p.filling, -1)
+		return
+	}
+	defer atomic.AddInt32(&p.filling, -1)
+
+	conn, err := p.dialFn(ctx, p.cfg)
+	if err != nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		conn.Close()
+		return
+	}
+	// Don't exceed maxSize
+	if len(p.entries) >= p.maxSize {
+		conn.Close()
+		return
+	}
+	p.entries = append(p.entries, entry{conn: conn, created: time.Now()})
+}
+
+// Acquire pops a warm TLS connection from the pool, sends a bootstrap to
+// assign the real target, waits for the server's OK, and returns the
+// connection ready for relay.
+//
+// After each attempt (hit or miss), one async fill is triggered to maintain
+// pool depth during active use. This ensures the pool naturally fills up to
+// maxSize after the first few requests.
+//
+// If the pool is empty or all candidates fail (expired TTL, bootstrap
+// failure), falls through to tunnel.Open() which establishes a fresh
+// fully-bootstrapped connection.
 func (p *Pool) Acquire(ctx context.Context, targetHost string, targetPort uint16, proto string) (net.Conn, error) {
 	for {
 		candidate := p.popEntry()
@@ -157,29 +164,32 @@ func (p *Pool) Acquire(ctx context.Context, targetHost string, targetPort uint16
 		}
 		if time.Since(candidate.created) >= p.ttl {
 			candidate.conn.Close()
+			// Trigger async fill after discarding expired entry
+			go p.fillOne(ctx)
 			continue
 		}
-		result, err := p.bootstrap(candidate.conn, targetHost, targetPort, proto)
-		if err != nil {
+		if err := p.bootstrap(candidate.conn, targetHost, targetPort, proto); err != nil {
 			candidate.conn.Close()
+			// Trigger async fill after failed bootstrap
+			go p.fillOne(ctx)
 			continue
 		}
-		if result {
-			atomic.AddUint64(&p.hits, 1)
-			return candidate.conn, nil
-		}
-		candidate.conn.Close()
+		// Successful hit — trigger async replacement
+		go p.fillOne(ctx)
+		atomic.AddUint64(&p.hits, 1)
+		n := atomic.LoadUint64(&p.hits)
+		log.Printf("pool HIT #%d for %s:%d", n, targetHost, targetPort)
+		return candidate.conn, nil
 	}
 
-	return tunnel.Open(ctx, p.cfg, targetHost, targetPort, proto)
+	log.Printf("pool MISS for %s:%d (size=%d)", targetHost, targetPort, len(p.entries))
+	// Trigger async fill on miss so next request might hit
+	go p.fillOne(ctx)
+	return p.openFn(ctx, p.cfg, targetHost, targetPort, proto)
 }
 
 // popEntry removes and returns the oldest entry (FIFO) from the pool.
 // Returns nil if the pool is empty.
-//
-// FIFO ordering ensures connections age evenly: older connections are
-// consumed first, preventing long-lived unused entries at the front
-// of the slice.
 func (p *Pool) popEntry() *entry {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -191,10 +201,9 @@ func (p *Pool) popEntry() *entry {
 	return &e
 }
 
-// bootstrap sends the actual target info over a warm connection and
-// waits for the server's OK response. Returns true if the server
-// accepted the re-bootstrap, false+error otherwise.
-func (p *Pool) bootstrap(conn net.Conn, targetHost string, targetPort uint16, proto string) (bool, error) {
+// bootstrap sends the target info on a warm TLS connection, waits for
+// the server's OK response, and returns nil on success.
+func (p *Pool) bootstrap(conn net.Conn, targetHost string, targetPort uint16, proto string) error {
 	payload := tunnel.BootstrapInfo{
 		Auth:  p.cfg.Token,
 		Host:  targetHost,
@@ -207,22 +216,26 @@ func (p *Pool) bootstrap(conn net.Conn, targetHost string, targetPort uint16, pr
 	bs, _ := json.Marshal(payload)
 	bs = append(bs, '\n')
 	if _, err := conn.Write(bs); err != nil {
-		return false, err
+		return err
 	}
 	statusBuf := make([]byte, 128)
 	n, err := conn.Read(statusBuf)
 	if err != nil {
-		return false, err
+		return err
 	}
 	status := string(statusBuf[:n])
 	if strings.HasPrefix(status, "OK") {
-		return true, nil
+		return nil
 	}
-	return false, fmt.Errorf("server refused: %s", strings.TrimSpace(status))
+	return fmt.Errorf("server refused: %s", strings.TrimSpace(status))
 }
 
-// Stop closes all pooled connections and stops the refill loop.
-// Safe to call multiple times.
+// PoolStats returns the cumulative pool hit count.
+func (p *Pool) PoolStats() uint64 {
+	return atomic.LoadUint64(&p.hits)
+}
+
+// Stop closes all pooled connections and stops the eviction loop.
 func (p *Pool) Stop() {
 	p.mu.Lock()
 	p.closed = true

@@ -105,7 +105,6 @@ func nextSessionID() string {
 }
 
 // BootstrapRequest is the JSON structure sent by the client in the first line.
-// Fields use pointers to distinguish missing vs zero-value for validation.
 type BootstrapRequest struct {
 	Auth  string `json:"auth"`
 	Host  string `json:"host"`
@@ -331,6 +330,13 @@ func cachedLookupHost(host string) net.IP {
 }
 
 func resolveHost(host string, port uint16) (string, error) {
+	// If host is already an IP address, skip DNS resolution entirely.
+	// This is an optimization for clients that resolve DNS locally
+	// (e.g., httpproxy and socks handlers) to avoid slow DNS lookups
+	// from the proxy server for international domains.
+	if ip := net.ParseIP(host); ip != nil {
+		return fmt.Sprintf("%s:%d", host, port), nil
+	}
 	ip := cachedLookupHost(host)
 	if ip == nil {
 		return "", fmt.Errorf("no address found for %s", host)
