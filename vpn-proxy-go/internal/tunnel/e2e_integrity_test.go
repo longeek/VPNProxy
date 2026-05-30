@@ -26,7 +26,7 @@ func TestReadLine_doesNotOverread(t *testing.T) {
 	wire.Write([]byte{0x00, 0x00, 0x00, 0x05, 0x00, 'h', 'e', 'l', 'l', 'o'})
 
 	// readLine from the buffer (byte-by-byte)
-	status, err := readLine(&wire)
+	status, err := ReadLine(&wire)
 	if err != nil {
 		t.Fatalf("readLine failed: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestReadLine_largeDataAfterOK(t *testing.T) {
 	wire.Write(payload)
 
 	// readLine from the buffer (byte-by-byte, safe)
-	status, err := readLine(&wire)
+	status, err := ReadLine(&wire)
 	if err != nil {
 		t.Fatalf("readLine: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestOKPlusDataInOneSegmentIntegrity(t *testing.T) {
 
 	// ===== CLIENT SIDE =====
 	// Step 1: Read "OK\n" using readLine (byte-by-byte, safe)
-	status, err := readLine(&segment)
+	status, err := ReadLine(&segment)
 	if err != nil {
 		t.Fatalf("readLine failed: %v", err)
 	}
@@ -400,7 +400,7 @@ func TestReuseCycleFraming(t *testing.T) {
 	// written before this test). We go straight to reading "OK\n" + chunks.
 
 	// Read "OK\n" via readLine
-	status, err := readLine(c)
+	status, err := ReadLine(c)
 	if err != nil {
 		t.Fatalf("readLine: %v", err)
 	}
@@ -474,7 +474,7 @@ func TestOldVsNewOKRead(t *testing.T) {
 	}
 
 	// NEW BEHAVIOR: readLine (byte-by-byte)
-	status, err := readLine(&newWire)
+	status, err := ReadLine(&newWire)
 	if err != nil {
 		t.Fatalf("readLine: %v", err)
 	}

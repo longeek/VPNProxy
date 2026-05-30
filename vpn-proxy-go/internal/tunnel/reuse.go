@@ -39,7 +39,7 @@ type countingReader struct {
 
 func (cr *countingReader) Read(p []byte) (int, error) {
 	n, err := cr.r.Read(p)
-	cr.total += int64(n)
+	atomic.AddInt64(&cr.total, int64(n))
 	return n, err
 }
 
@@ -93,9 +93,6 @@ func (rt *ReusableTunnel) readChunkTyped() (byte, []byte, error) {
 		return 0, nil, err
 	}
 
-	if totalLen == 0 {
-		return 0, nil, nil
-	}
 	return raw[0], raw[1:], nil
 }
 
@@ -196,7 +193,7 @@ func (rt *ReusableTunnel) ReadOKChunk() (bool, error) {
 
 // StreamBytes returns total bytes read from the underlying connection.
 func (rt *ReusableTunnel) StreamBytes() int64 {
-	return rt.br.total
+	return atomic.LoadInt64(&rt.br.total)
 }
 
 // ---------------------------------------------------------------------------

@@ -139,7 +139,7 @@ func Open(ctx context.Context, cfg *Config, targetHost string, targetPort uint16
 		// may send relay data (chunk headers) immediately after "OK\n" and a
 		// buffered read would consume those bytes, corrupting the stream.
 		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-		statusLine, sErr := readLine(conn)
+		statusLine, sErr := ReadLine(conn)
 		conn.SetReadDeadline(time.Time{})
 		if sErr != nil {
 			conn.Close()
@@ -199,12 +199,11 @@ func putRelayBuf(b []byte) {
 	relayBufPool.Put(&b)
 }
 
-// readLine reads from r byte-by-byte until '\n' and returns the line
-// content without the trailing '\n'. This is used for reading status
-// responses from the server. Byte-by-byte reading ensures we never consume
-// more bytes than the status line itself — critical because the server may
-// send relay data immediately after the status line.
-func readLine(r io.Reader) (string, error) {
+// ReadLine reads from r byte-by-byte until '\n' and returns the line
+// content without the trailing '\n'. Byte-by-byte reading ensures we never
+// consume more bytes than the status line itself — critical because the
+// server may send relay data immediately after the status line.
+func ReadLine(r io.Reader) (string, error) {
 	var line []byte
 	one := make([]byte, 1)
 	for {
